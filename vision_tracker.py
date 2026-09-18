@@ -96,8 +96,8 @@ def find_camera_index(requested_index=None):
         except Exception:
             pass
 
-    # Prioritas 2: Scan index kamera dari 1 ke 5, lalu 0
-    test_indices = [1, 2, 3, 0]
+    # Prioritas 2: Scan index kamera
+    test_indices = [0, 1, 2] if sys.platform == 'darwin' else [1, 2, 3, 0]
     for idx in test_indices:
         try:
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2 if sys.platform.startswith('linux') else cv2.CAP_ANY)
@@ -105,11 +105,13 @@ def find_camera_index(requested_index=None):
                 ret, _ = cap.read()
                 cap.release()
                 if ret:
-                    return idx, f"/dev/video{idx}"
+                    cam_name = f"Camera {idx}" if sys.platform == 'darwin' else f"/dev/video{idx}"
+                    return idx, cam_name
         except Exception:
             pass
 
-    return 0, "/dev/video0"
+    default_name = "Camera 0" if sys.platform == 'darwin' else "/dev/video0"
+    return 0, default_name
 
 def find_serial_port():
     """Mencari port serial ESP32 yang tersedia di Linux Armbian."""
@@ -841,7 +843,11 @@ def main():
 
     if not cap.isOpened():
         print(f"[ERROR] Tidak dapat membuka kamera pada index {cam_index} ({cam_device})!")
-        print("[ERROR] Cek apakah webcam USB sudah terhubung dengan: ls -l /dev/video*")
+        if sys.platform == 'darwin':
+            print("[MACOS TIPS] Izin kamera belum diberikan ke aplikasi Terminal / iTerm.")
+            print("[MACOS TIPS] Buka: System Settings -> Privacy & Security -> Camera, lalu pastikan Terminal / iTerm diizinkan (ON).")
+        else:
+            print("[ERROR] Cek apakah webcam USB sudah terhubung dengan: ls -l /dev/video*")
         return
 
     # Optimasi Hardware UVC Camera (Backlight Compensation, Anti-Silau & Anti-Flicker)
