@@ -233,59 +233,147 @@ def enhance_dynamic_range(frame, clip_limit=2.5):
 
 def get_clothes_color_signature(frame, box):
     """
-    Mengekstrak profil histogram warna pakaian (baju/celana) dari kotak target.
-    Menggunakan 3D HSV (Hue, Saturation, Value) sehingga dapat membedakan:
-    - Pakaian berwarna (merah, biru, hijau, dll)
-    - Pakaian netral (baju abu-abu, putih) vs benda hitam pekat (monitor/layar komputer)
+    Sistem Memori Pakaian Cerdas (Smart Dual-Zone Clothes Re-ID):
+    Merekam profil warna 2 zona terpisah dalam kotak tubuh:
+    1. Zona Atas (15% - 52% tinggi): Baju / Dada / Punggung Atas.
+    2. Zona Bawah (52% - 88% tinggi): Baju Bawah / Pinggang / Celana.
+    
+    Fitur Anti-Salah Majikan & Anti-Silau:
+    - 2D Hue-Saturation (16x12 bin): Fokus pada pigmen warna murni kain (kebal bayangan & lampu plafon).
+    - 1D Value (8 bin): Menjaga perbedaan warna gelap vs terang.
+    - Trimming Tepi (20% kiri & kanan): Hanya mengambil kain tubuh tengah, membuang latar tembok/lemari.
     """
     try:
         x, y, w, h = [int(v) for v in box]
         x = max(0, min(frame.shape[1] - 1, x))
         y = max(0, min(frame.shape[0] - 1, y))
-        w = max(4, min(frame.shape[1] - x, w))
-        h = max(4, min(frame.shape[0] - y, h))
-        # Ambil area pakaian utama (tengah vertikal 15% s.d. 85%, tengah horizontal 20% s.d. 80%)
-        # Menghindari leher atas dan pinggiran background di sisi kiri/kanan
-        roi = frame[y + int(h*0.15):y + int(h*0.85), x + int(w*0.20):x + int(w*0.80)]
-        if roi.size == 0:
+        w = max(6, min(frame.shape[1] - x, w))
+        h = max(8, min(frame.shape[0] - y, h))
+
+        # Fokus pada bagian tengah kain (buang 20% margin kiri dan kanan agar warna tembok tidak tercampur)
+        cx1 = x + int(w * 0.20)
+        cx2 = x + int(w * 0.80)
+        if cx2 <= cx1:
+            cx1, cx2 = x, x + w
+
+        # Zona 1: Baju Atas (dada / punggung)
+        uy1 = y + int(h * 0.15)
+        uy2 = y + int(h * 0.52)
+        roi_upper = frame[uy1:uy2, cx1:cx2]
+
+        # Zona 2: Bawah (pinggang / celana)
+        ly1 = y + int(h * 0.52)
+        ly2 = y + int(h * 0.88)
+        roi_lower = frame[ly1:ly2, cx1:cx2]
+
+        def compute_patch_hist(roi):
+            if roi.size == 0:
+                return None, None
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            # 2D HS: 16 bin Hue, 12 bin Saturation (warna kain murni)
+            hist_hs = cv2.calcHist([hsv], [0, 1], None, [16, 12], [0, 180, 0, 256])
+            cv2.normalize(hist_hs, hist_hs, alpha=1.0, norm_type=cv2.NORM_L1)
+            # 1D V: 8 bin Value (tingkat gelap-terang)
+            hist_v = cv2.calcHist([hsv], [2], None, [8], [0, 256])
+            cv2.normalize(hist_v, hist_v, alpha=1.0, norm_type=cv2.NORM_L1)
+            return hist_hs, hist_v
+
+        u_hs, u_v = compute_patch_hist(roi_upper)
+        l_hs, l_v = compute_patch_hist(roi_lower)
+
+        if u_hs is None and l_hs is None:
             return None
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        # 3D Histogram: 12 bin Hue, 8 bin Saturation, 8 bin Value
-        hist = cv2.calcHist([hsv], [0, 1, 2], None, [12, 8, 8], [0, 180, 0, 256, 0, 256])
-        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
-        return hist
+
+        return {
+            "u_hs": u_hs,
+            "u_v": u_v,
+            "l_hs": l_hs,
+            "l_v": l_v
+        }
     except Exception:
         return None
 
-def compare_clothes_color(frame, box, target_hist):
+def compare_clothes_color(frame, box, target_sig):
     """
-    Memeriksa apakah kotak target masih memiliki kecocokan warna pakaian.
-    Menggunakan Histogram Intersection pada histogram ternormalisasi NORM_L1.
-    Nilai berkisar antara 0.0 (tidak ada kesamaan warna) s.d. 1.0 (100% identik).
+    Memeriksa kecocokan pakaian secara Dual-Zone (Baju Atas + Celana):
+    - 75% bobot pada Hue-Saturation (warna kain asli).
+    - 25% bobot pada Value (kecerahan).
+    - Skor gabungan: 60% Baju Atas + 40% Celana/Bawah.
+    Jika orang lain lewat memakai baju mirip tetapi celananya berbeda, target langsung ditolak!
     """
-    if target_hist is None:
+    if target_sig is None:
         return 1.0
-    curr_hist = get_clothes_color_signature(frame, box)
-    if curr_hist is None:
+    curr_sig = get_clothes_color_signature(frame, box)
+    if curr_sig is None:
         return 0.5
     try:
-        score = cv2.compareHist(target_hist, curr_hist, cv2.HISTCMP_INTERSECT)
-        return max(0.0, min(1.0, float(score)))
+        # Dukungan jika format lama (single numpy array)
+        if not isinstance(target_sig, dict):
+            return 0.7
+
+        def compare_patch(t_hs, t_v, c_hs, c_v):
+            if t_hs is None or c_hs is None:
+                return 0.5
+            s_hs = float(cv2.compareHist(t_hs, c_hs, cv2.HISTCMP_INTERSECT))
+            s_v = float(cv2.compareHist(t_v, c_v, cv2.HISTCMP_INTERSECT)) if (t_v is not None and c_v is not None) else 0.5
+            return 0.75 * s_hs + 0.25 * s_v
+
+        score_upper = compare_patch(target_sig.get("u_hs"), target_sig.get("u_v"),
+                                    curr_sig.get("u_hs"), curr_sig.get("u_v"))
+        score_lower = compare_patch(target_sig.get("l_hs"), target_sig.get("l_v"),
+                                    curr_sig.get("l_hs"), curr_sig.get("l_v"))
+
+        total_score = 0.60 * score_upper + 0.40 * score_lower
+        return max(0.0, min(1.0, float(total_score)))
     except Exception:
         return 0.5
 
-def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detector=None, face_cascade=None, profile_type="torso"):
+def update_clothes_color_signature(target_sig, curr_sig, alpha=0.96):
     """
-    Sistem Persistent Re-Identification (Re-ID) & AI Auto-Snap:
-    1. Prioritas 1: YuNet AI Neural Network (deteksi wajah & manusia di segala kondisi cahaya & jarak jauh 3-5m).
-    2. Prioritas 2: Haar Cascade Wajah (fallback jika YuNet tidak tersedia).
-    3. Prioritas 3: Full-Frame Multi-Scale Grid Scan (mencakup seluruh tinggi frame untuk tampak belakang/punggung).
+    Memperbarui memori pakaian secara adaptif (Exponential Moving Average):
+    Menyesuaikan sedikit perubahan warna saat berpindah lampu ruangan tanpa melupakan warna asli.
+    """
+    if target_sig is None or curr_sig is None:
+        return target_sig
+    try:
+        updated = {}
+        for key in ["u_hs", "u_v", "l_hs", "l_v"]:
+            t_h = target_sig.get(key)
+            c_h = curr_sig.get(key)
+            if t_h is not None and c_h is not None:
+                new_h = cv2.addWeighted(t_h, alpha, c_h, 1.0 - alpha, 0)
+                cv2.normalize(new_h, new_h, alpha=1.0, norm_type=cv2.NORM_L1)
+                updated[key] = new_h
+            else:
+                updated[key] = t_h
+        return updated
+    except Exception:
+        return target_sig
+
+def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detector=None, face_cascade=None, profile_type="torso", last_target_box=None):
+    """
+    Sistem Persistent Re-Identification (Re-ID) & Smart Clothes Matcher:
+    1. Prioritas 1: YuNet AI Neural Network Detector (~5-9 ms).
+    2. Prioritas 2: Haar Cascade Fallback.
+    3. Prioritas 3: Full-Frame Multi-Scale Grid Scan untuk tampak punggung.
+    Menerapkan Spatial Continuity Gating (anti-teleport) agar tidak melompat ke orang asing.
     """
     if target_hist is None:
         return None, 0.0
 
     best_box = None
     best_score = 0.0
+
+    def calculate_effective_score(cand_b, raw_s):
+        if last_target_box is None:
+            return raw_s
+        lx = last_target_box[0] + last_target_box[2] // 2
+        ly = last_target_box[1] + last_target_box[3] // 2
+        cx = cand_b[0] + cand_b[2] // 2
+        cy = cand_b[1] + cand_b[3] // 2
+        dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+        prox_factor = max(0.70, 1.0 - (dist / 380.0))
+        return raw_s * prox_factor
 
     # 1. Prioritas Utama: YuNet AI Neural Network Detector (~5-9 ms)
     if yunet_detector:
@@ -297,12 +385,11 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                     cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
                     test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
                     s = compare_clothes_color(frame, test_b, target_hist)
-                    if s > best_score:
-                        best_score = s
+                    eff_s = calculate_effective_score(test_b, s)
+                    if eff_s > best_score:
+                        best_score = eff_s
                         best_box = test_b
 
-            # Karena YuNet sudah mengonfirmasi keberadaan manusia asli dengan neural net,
-            # ambang verifikasi warna bisa fleksibel (>= 36%) jika target shirtless/berubah cahaya
             if best_score >= 0.36:
                 return best_box, max(0.55, best_score)
 
@@ -319,8 +406,9 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                         cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
                         test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
                         s = compare_clothes_color(frame, test_b, target_hist)
-                        if s > best_score:
-                            best_score = s
+                        eff_s = calculate_effective_score(test_b, s)
+                        if eff_s > best_score:
+                            best_score = eff_s
                             best_box = test_b
 
                 if best_score >= 0.42:
@@ -340,11 +428,12 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             for y_cand in range(10, max(11, FRAME_HEIGHT - ch + 1), step_y):
                 cand_box = (x_cand, y_cand, cw, ch)
                 score = compare_clothes_color(frame, cand_box, target_hist)
-                if score > best_score:
-                    best_score = score
+                eff_s = calculate_effective_score(cand_box, score)
+                if eff_s > best_score:
+                    best_score = eff_s
                     best_box = cand_box
 
-    if best_score >= 0.45:
+    if best_score >= 0.42:
         return best_box, best_score
 
     return None, best_score
@@ -1307,8 +1396,7 @@ def main():
                         if match_score >= 0.68:
                             curr_hist = get_clothes_color_signature(frame, target_box)
                             if curr_hist is not None and target_clothes_hist is not None:
-                                target_clothes_hist = cv2.addWeighted(target_clothes_hist, 0.95, curr_hist, 0.05, 0)
-                                cv2.normalize(target_clothes_hist, target_clothes_hist, alpha=1.0, norm_type=cv2.NORM_L1)
+                                target_clothes_hist = update_clothes_color_signature(target_clothes_hist, curr_hist, alpha=0.96)
 
                         if match_score >= 0.38 or ai_reanchored:
                             mismatch_streak = 0
@@ -1325,7 +1413,8 @@ def main():
                                 re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                        yunet_detector=yunet_detector,
                                                                        face_cascade=face_cascade,
-                                                                       profile_type=current_profile)
+                                                                       profile_type=current_profile,
+                                                                       last_target_box=target_box)
                                 if re_box and re_score >= 0.42:
                                     print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                     tracker = create_tracker(current_mode)
@@ -1344,7 +1433,8 @@ def main():
                         re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
-                                                               profile_type=current_profile)
+                                                               profile_type=current_profile,
+                                                               last_target_box=target_box)
                         if re_box and re_score >= 0.42:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
