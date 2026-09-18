@@ -159,34 +159,44 @@ def enhance_dynamic_range(frame, clip_limit=2.5):
         return frame
 
 def get_clothes_color_signature(frame, box):
-    """Mengekstrak profil histogram warna HSV pakaian (baju/celana) dari kotak target."""
+    """
+    Mengekstrak profil histogram warna pakaian (baju/celana) dari kotak target.
+    Menggunakan 3D HSV (Hue, Saturation, Value) sehingga dapat membedakan:
+    - Pakaian berwarna (merah, biru, hijau, dll)
+    - Pakaian netral (baju abu-abu, putih) vs benda hitam pekat (monitor/layar komputer)
+    """
     try:
         x, y, w, h = [int(v) for v in box]
         x = max(0, min(frame.shape[1] - 1, x))
         y = max(0, min(frame.shape[0] - 1, y))
         w = max(4, min(frame.shape[1] - x, w))
         h = max(4, min(frame.shape[0] - y, h))
-        # Ambil area pakaian (tengah vertikal 25% s.d. 85%, tengah horizontal 20% s.d. 80%)
-        roi = frame[y + int(h*0.25):y + int(h*0.85), x + int(w*0.20):x + int(w*0.80)]
+        # Ambil area pakaian (tengah vertikal 20% s.d. 85%, tengah horizontal 15% s.d. 85%)
+        roi = frame[y + int(h*0.20):y + int(h*0.85), x + int(w*0.15):x + int(w*0.85)]
         if roi.size == 0:
             return None
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 20, 256])
-        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        # 3D Histogram: 12 bin Hue, 8 bin Saturation, 8 bin Value
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, [12, 8, 8], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
         return hist
     except Exception:
         return None
 
 def compare_clothes_color(frame, box, target_hist):
-    """Memeriksa apakah kotak target masih memiliki kecocokan warna pakaian."""
+    """
+    Memeriksa apakah kotak target masih memiliki kecocokan warna pakaian.
+    Menggunakan Histogram Intersection pada histogram ternormalisasi NORM_L1.
+    Nilai berkisar antara 0.0 (tidak ada kesamaan warna) s.d. 1.0 (100% identik).
+    """
     if target_hist is None:
         return 1.0
     curr_hist = get_clothes_color_signature(frame, box)
     if curr_hist is None:
         return 0.5
     try:
-        score = cv2.compareHist(target_hist, curr_hist, cv2.HISTCMP_CORREL)
-        return max(0.0, min(1.0, score))
+        score = cv2.compareHist(target_hist, curr_hist, cv2.HISTCMP_INTERSECT)
+        return max(0.0, min(1.0, float(score)))
     except Exception:
         return 0.5
 
@@ -464,10 +474,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     
                     const statusEl = document.getElementById('target-status');
                     statusEl.innerText = data.status;
-                    if (data.status.includes('LOCKED') || data.status.includes('DETECTED')) {
-                        statusEl.style.color = 'var(--success-color)';
-                    } else if (data.status.includes('LOCKING')) {
+                    if (data.status.includes('MISMATCH')) {
                         statusEl.style.color = 'var(--warn-color)';
+                    } else if (data.status.includes('LOCKED') || data.status.includes('DETECTED')) {
+                        statusEl.style.color = 'var(--success-color)';
+                    } else if (data.status.includes('LOCKING') || data.status.includes('RELOCK')) {
+                        statusEl.style.color = 'var(--accent-color)';
                     } else {
                         statusEl.style.color = 'var(--danger-color)';
                     }
@@ -475,18 +487,23 @@ HTML_PAGE = """<!DOCTYPE html>
                     // Update Kecocokan Warna Pakaian
                     const clothesEl = document.getElementById('clothes-val');
                     const clothesStatusEl = document.getElementById('clothes-status');
+                    const matchPct = (data.clothes_match_pct !== undefined) ? data.clothes_match_pct : 100;
                     if (data.has_target) {
-                        const matchPct = (data.clothes_match_pct !== undefined) ? data.clothes_match_pct : 100;
                         clothesEl.innerText = matchPct + '%';
-                        if (matchPct >= 45) {
+                        if (matchPct >= 50) {
                             clothesEl.style.color = 'var(--success-color)';
                             clothesStatusEl.innerText = 'WARNA BAJU COCOK';
                             clothesStatusEl.style.color = 'var(--success-color)';
                         } else {
                             clothesEl.style.color = 'var(--warn-color)';
-                            clothesStatusEl.innerText = 'WARNA BEDA/TERHALANG';
+                            clothesStatusEl.innerText = 'WARNA BEDA / TERHALANG';
                             clothesStatusEl.style.color = 'var(--warn-color)';
                         }
+                    } else if (data.status.includes('MISMATCH')) {
+                        clothesEl.innerText = matchPct + '%';
+                        clothesEl.style.color = 'var(--danger-color)';
+                        clothesStatusEl.innerText = 'MENOLAK OBJEK LAIN';
+                        clothesStatusEl.style.color = 'var(--danger-color)';
                     } else {
                         clothesEl.innerText = '--%';
                         clothesStatusEl.innerText = 'MENUNGGU TARGET';
@@ -793,6 +810,7 @@ def main():
     dist_status = "SEARCHING"
     last_face_scan = 0
     frame_counter = 0
+    mismatch_streak = 0
 
     print("[SYSTEM] Pipeline kamera aktif. Memulai pelacakan...\n")
 
@@ -841,6 +859,8 @@ def main():
                 if vision_state.trigger_reset:
                     tracking_active = False
                     target_clothes_hist = None
+                    mismatch_streak = 0
+                    countdown_duration = 3.0
                     vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     vision_state.trigger_reset = False
@@ -856,6 +876,8 @@ def main():
                     active_lock_box = init_box
                     tracking_active = False
                     target_clothes_hist = None
+                    mismatch_streak = 0
+                    countdown_duration = 3.0
                     vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Profil target diubah ke '{prof_info['name']}'.")
@@ -866,6 +888,8 @@ def main():
                     vision_state.change_mode_req = None
                     tracking_active = False
                     target_clothes_hist = None
+                    mismatch_streak = 0
+                    countdown_duration = 3.0
                     vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Ganti mode ke '{current_mode.upper()}' dari Web HUD.")
@@ -943,17 +967,38 @@ def main():
                         with vision_state.lock:
                             vision_state.clothes_match_pct = clothes_pct
 
-                        if match_score >= 0.40:
+                        if match_score >= 0.50:
+                            mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
                         else:
+                            mismatch_streak += 1
                             status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
                             status_color = (0, 165, 255)
+
+                            # FAILSAFE: Jika warna target tidak cocok selama >= 10 frame berturut-turut (~0.4 - 0.6s)
+                            # Berarti tracker menempel ke objek lain (misal monitor hitam, dinding, orang lain).
+                            # Segera tolak target dan lakukan Auto-Relock ke pengguna!
+                            if mismatch_streak >= 10:
+                                print(f"[TRACKER] Target mismatch ({clothes_pct}% match)! Menolak objek latar, memulai auto-relock...")
+                                tracking_active = False
+                                lock_countdown_start = time.time()
+                                countdown_duration = 1.5  # Countdown cepat untuk re-lock
+                                target_clothes_hist = None
+                                target_box = None
+                                mismatch_streak = 0
+                                status_text = "AUTO_RELOCKING"
+                                status_color = (0, 255, 255)
                     else:
                         status_text = "TARGET_LOST"
                         status_color = (0, 0, 255)
                         with vision_state.lock:
                             vision_state.clothes_match_pct = 0
+                        tracking_active = False
+                        lock_countdown_start = time.time()
+                        countdown_duration = 2.0
+                        target_clothes_hist = None
+                        mismatch_streak = 0
 
             # --- METODE 2: FACE DETECTOR (CASCADE) ---
             elif current_mode == "face":
@@ -975,7 +1020,9 @@ def main():
             # Hitung Deviasi Piksel & Estimasi Jarak Monokular
             err_x = 0
             err_y = 0
-            has_target = target_box is not None
+            # Target HANYA valid jika bounding box ada DAN bukan COLOR_MISMATCH berulang!
+            # Mencegah pengiriman serial dan pergerakan mobil menuju monitor/dinding yang salah.
+            has_target = (target_box is not None) and (mismatch_streak < 3)
 
             if has_target:
                 tx, ty, tw, th = target_box
@@ -1030,7 +1077,7 @@ def main():
                 cv2.line(annotated_frame, (CENTER_X, CENTER_Y), (cx, cy), (255, 255, 0), 2)
 
                 # Badge label target & jarak di atas kotak
-                tag_label = f"{prof_data['label']} | ~{smooth_distance:.2f}m"
+                tag_label = f"{prof_data['label']} | {smooth_distance:.2f}m"
                 if current_mode in ["kcf", "mosse"]:
                     tag_label += f" | Baju:{vision_state.clothes_match_pct}%"
                 cv2.rectangle(annotated_frame, (tx, max(0, ty - 18)), (tx + len(tag_label) * 8 + 6, max(18, ty)), (0, 0, 0), -1)
@@ -1089,8 +1136,11 @@ def main():
             cv2.putText(annotated_frame, f"Status: {status_text}", (10, 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
             if has_target:
-                cv2.putText(annotated_frame, f"ErrX: {err_x:+d}px | ErrY: {err_y:+d}px | Jarak: ~{smooth_distance:.2f}m", (10, FRAME_HEIGHT - 10),
+                cv2.putText(annotated_frame, f"ErrX: {err_x:+d}px | ErrY: {err_y:+d}px | Jarak: {smooth_distance:.2f}m", (10, FRAME_HEIGHT - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+            elif mismatch_streak >= 3:
+                cv2.putText(annotated_frame, f"FAILSAFE: OBJEK LAIN DITOLAK ({vision_state.clothes_match_pct}%)", (10, FRAME_HEIGHT - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1)
 
             # Update State untuk Web Dashboard
             with vision_state.lock:
