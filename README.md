@@ -120,20 +120,40 @@ Terminal SSH Anda tetap menampilkan status telemetri yang bersih dan tidak banji
 
 ---
 
-## 6. Tips Menjalankan Program di Background (Screen)
+---
 
-Agar program tetap berjalan meskipun koneksi SSH laptop ditutup:
+## 7. Panduan Bench Test ESP32 (Servo Pan-Tilt & Sensor Laser VL53L0X)
 
-1. Buat sesi screen:
-   ```bash
-   screen -S vision
-   ```
-2. Jalankan tracker:
-   ```bash
-   python3 vision_tracker.py
-   ```
-3. Tekan **`Ctrl + A` lalu `D`** untuk melepas sesi (*detach*). Skrip dan Web HUD tetap berjalan di background!
-4. Buka kembali sesi SSH kapan saja:
-   ```bash
-   screen -r vision
-   ```
+Firmware lengkap ESP32 tersedia di [`esp32_servo_tracking/esp32_servo_tracking.ino`](esp32_servo_tracking/esp32_servo_tracking.ino).
+
+### A. Skema Pengkabelan Pinout ESP32
+| Komponen | Pin Modul | Pin ESP32 | Keterangan |
+| :--- | :--- | :--- | :--- |
+| **Servo Pan (Horizontal)** | Sinyal (Oranye/Kuning) | **GPIO 18** | PWM Servo Pan |
+| | VCC (Merah) | **VIN (5V)** | Sumber daya servo |
+| | GND (Cokelat/Hitam) | **GND** | Ground bersama |
+| **Servo Tilt (Vertikal)** | Sinyal (Oranye/Kuning) | **GPIO 19** | PWM Servo Tilt |
+| | VCC (Merah) | **VIN (5V)** | Sumber daya servo |
+| | GND (Cokelat/Hitam) | **GND** | Ground bersama |
+| **Sensor Laser VL53L0X** | **VCC / VIN** | **3.3V** | Daya sensor ToF |
+| | **GND** | **GND** | Ground bersama |
+| | **SDA** | **GPIO 21** | I2C Data |
+| | **SCL** | **GPIO 22** | I2C Clock |
+
+### B. Persiapan Arduino IDE
+1. Pasang dua library via **Tools -> Manage Libraries...**:
+   - `ESP32Servo` oleh Kevin Harrington
+   - `Adafruit_VL53L0X` oleh Adafruit
+2. Buka file `esp32_servo_tracking/esp32_servo_tracking.ino`.
+3. Pilih Board **ESP32 Dev Module**, colok kabel USB, lalu klik **Upload**.
+
+### C. Pengujian di Meja Kerja (Serial Monitor 115200)
+Setelah upload, buka **Serial Monitor** pada kecepatan **115200 bps**. Anda akan melihat telemetri real-time:
+```text
+[STATUS: TERKUNCI ] Pan: 92° Tilt: 90° | Jarak: 84 cm (LASER) | Aksi: 🟢 [ZONA TENANG - STOP] (70-90cm)
+[STATUS: TERKUNCI ] Pan: 92° Tilt: 90° | Jarak: 125 cm (LASER) | Aksi: ⬆️  [MAJU MENGEJAR] (>100cm)
+[STATUS: TERKUNCI ] Pan: 92° Tilt: 90° | Jarak: 25 cm (LASER) | Aksi: 🛑 [EMERGENCY CUTOFF] (<30cm!)
+```
+
+Ketika kabel USB ESP32 dicolokkan ke STB, Python di STB akan otomatis mengirim data deviasi $X, Y$ dan estimasi jarak secara real-time!
+

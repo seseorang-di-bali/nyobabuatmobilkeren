@@ -661,6 +661,7 @@ def main():
 
     prev_time = time.time()
     last_serial_send = 0
+    last_serial_reconnect = 0
     last_terminal_print = 0
     last_idle_encode = 0
     current_mode = args.mode
@@ -892,9 +893,23 @@ def main():
                     ser.write(msg.encode('utf-8'))
                     last_serial_send = now_time
                 except Exception as e:
-                    print(f"[SERIAL ERROR] {e}")
+                    print(f"[SERIAL ERROR] Komunikasi terputus: {e}")
                     ser = None
-                    serial_state_str = "ERR"
+                    serial_state_str = "DISCONNECTED"
+                    vision_state.serial_state = "DISCONNECTED"
+            elif ser is None and not args.dry_run and (now_time - last_serial_reconnect > 2.0):
+                # Percobaan Auto-Reconnect berkala jika kabel ESP32 dicabut-pasang
+                last_serial_reconnect = now_time
+                reconnect_port = args.port or find_serial_port()
+                if reconnect_port:
+                    try:
+                        ser = serial.Serial(reconnect_port, 115200, timeout=0.05)
+                        serial_state_str = "TX_OK"
+                        vision_state.serial_state = "TX_OK"
+                        vision_state.serial_port = reconnect_port
+                        print(f"[SERIAL] Auto-reconnect berhasil ke ESP32 pada: {reconnect_port}")
+                    except Exception:
+                        ser = None
 
             # Hitung FPS
             fps = 1.0 / (now_time - prev_time + 1e-6)

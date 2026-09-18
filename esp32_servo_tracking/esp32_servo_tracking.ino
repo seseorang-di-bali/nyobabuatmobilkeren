@@ -1,23 +1,41 @@
 /**
  * esp32_servo_tracking.ino
- * Firmware ESP32 - Pengendali Servo Pan-Tilt Berbasis Visual Serial
+ * Firmware ESP32 - Pengendali Servo Pan-Tilt & Sensor Laser VL53L0X (Bench Test)
+ * Bagian dari Proyek Autonomous Vision-Guided Following Robot
  *
  * Kompatibel dengan: Arduino IDE / PlatformIO
- * Library yang dibutuhkan: ESP32Servo (instal via Arduino Library Manager)
  *
- * Pinout ESP32:
- * - Servo Pan  (Horizontal) : GPIO 18
- * - Servo Tilt (Vertikal)   : GPIO 19
- * - Baud Rate Serial        : 115200 bps
+ * Library yang dibutuhkan (Pasang via Arduino IDE Library Manager):
+ * 1. "ESP32Servo" oleh Kevin Harrington
+ * 2. "Adafruit_VL53L0X" oleh Adafruit
+ *
+ * Wiring Pinout ESP32:
+ * -------------------------------------------------------------
+ * 1. Servo Pan  (Horizontal) : Signal -> GPIO 18 (VCC 5V, GND)
+ * 2. Servo Tilt (Vertikal)   : Signal -> GPIO 19 (VCC 5V, GND)
+ * 3. Sensor Laser VL53L0X (I2C):
+ *    - VIN / VCC : 3.3V (atau 5V sesuai modul)
+ *    - GND       : GND
+ *    - SDA       : GPIO 21
+ *    - SCL       : GPIO 22
+ * 4. Komunikasi Serial ke STB/PC : USB Serial (Baud Rate 115200 bps)
+ * -------------------------------------------------------------
+ *
+ * Protokol Serial yang Diterima:
+ * - "X:<err_x>,Y:<err_y>,D:<dist_cm>\n" (Tracking aktif dengan estimasi jarak)
+ * - "X:<err_x>,Y:<err_y>\n" (Tracking aktif tanpa jarak)
+ * - "LOST\n" (Target terlepas)
  */
 
+#include <Wire.h>
 #include <ESP32Servo.h>
+#include <Adafruit_VL53L0X.h>
 
-// Definisi Pin & Batasan Servo
+// ================= PIN & BATASAN SERVO =================
 const int PIN_SERVO_PAN  = 18;
 const int PIN_SERVO_TILT = 19;
 
-// Batasan Sudut Aman Servo (Mencegah gir servo macet / terbakar)
+// Batasan Sudut Aman Servo (Mencegah gir SG90 mentok / rusak)
 const float PAN_MIN  = 20.0;
 const float PAN_MAX  = 160.0;
 const float PAN_MID  = 90.0;
@@ -26,87 +44,228 @@ const float TILT_MIN = 50.0;
 const float TILT_MAX = 130.0;
 const float TILT_MID = 90.0;
 
-// Parameter Kontrol
-const int DEADZONE_PX   = 12;    // Toleransi agar servo tidak bergetar (jitter)
-const float KP_PAN      = 0.04;  // Gain proporsional horizontal (atur kecepatan respons)
-const float KP_TILT     = 0.03;  // Gain proporsional vertikal
-const unsigned long TIMEOUT_MS = 500; // Timeout jika komunikasi serial terputus
+// Parameter Kendali Servo
+const int DEADZONE_PX   = 12;    // Zona toleransi anti-jitter (piksel)
+const float KP_PAN      = 0.04;  // Kecepatan respon belok Pan
+const float KP_TILT     = 0.03;  // Kecepatan respon Tilt
+const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
+// ================= OBJEK PERANGKAT =================
 Servo servoPan;
 Servo servoTilt;
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 
+// ================= VARIABEL GLOBAL =================
 float currentPan  = PAN_MID;
 float currentTilt = TILT_MID;
 
+int targetErrX = 0;
+int targetErrY = 0;
+int cameraDistCm = 0;
+
+int laserDistCm = -1;
+bool hasLaserSensor = false;
+
+bool targetLocked = false;
 unsigned long lastPacketTime = 0;
-bool targetLost = true;
+unsigned long lastTelemetryPrint = 0;
+
+// Status Aksi Sasis Mobil (Simulasi Bench Test)
+enum RobotAction {
+  ACT_EMERGENCY_STOP,
+  ACT_STOP_ZONE_TENANG,
+  ACT_MAJU_MENGEJAR,
+  ACT_MUNDUR_MENJAUH,
+  ACT_SEARCHING
+};
+RobotAction currentAction = ACT_SEARCHING;
 
 void setup() {
   Serial.begin(115200);
-  
-  // Konfigurasi Timer & Pin Servo untuk ESP32
+  delay(500);
+
+  Serial.println("\n==================================================");
+  Serial.println("   AUTONOMOUS ROBOT: ESP32 VISION & TOF CONTROLLER");
+  Serial.println("==================================================");
+
+  // 1. Inisialisasi Servo
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
-  servoPan.setPeriodHertz(50);   // Standard 50Hz servo SG90
+  servoPan.setPeriodHertz(50);
   servoTilt.setPeriodHertz(50);
 
-  servoPan.attach(PIN_SERVO_PAN, 500, 2400);   // Pulse width standar SG90
+  servoPan.attach(PIN_SERVO_PAN, 500, 2400);
   servoTilt.attach(PIN_SERVO_TILT, 500, 2400);
 
-  // Set posisi awal di tengah (90 derajat)
   servoPan.write((int)currentPan);
   servoTilt.write((int)currentTilt);
+  Serial.println("[SERVO] Pan (GPIO 18) & Tilt (GPIO 19) Siap pada 90 Derajat.");
 
-  Serial.println("[ESP32] Sistem Servo Tracking Siap. Menunggu data serial dari PC...");
+  // 2. Inisialisasi Bus I2C & Sensor Laser VL53L0X
+  Wire.begin(21, 22); // SDA = 21, SCL = 22
+  Serial.print("[LASER] Mendeteksi Sensor VL53L0X pada I2C... ");
+  if (lox.begin()) {
+    hasLaserSensor = true;
+    Serial.println("OK! Sensor Laser Aktif.");
+  } else {
+    hasLaserSensor = false;
+    Serial.println("TIDAK DITEMUKAN! (Fallback menggunakan jarak kamera).");
+  }
+
+  Serial.println("[SYSTEM] Menunggu paket serial dari STB / PC...");
+  Serial.println("--------------------------------------------------\n");
 }
 
 void loop() {
-  // 1. Parsing Serial Non-Blocking
-  if (Serial.available() > 0) {
+  // 1. BACA PAKET SERIAL NON-BLOCKING DARI STB/PC
+  while (Serial.available() > 0) {
     String packet = Serial.readStringUntil('\n');
     packet.trim();
 
+    if (packet.length() == 0) continue;
+
     if (packet == "LOST") {
-      targetLost = true;
+      targetLocked = false;
+      targetErrX = 0;
+      targetErrY = 0;
+      cameraDistCm = 0;
     } 
-    else if (packet.startsWith("X:") && packet.indexOf(",Y:") != -1) {
+    else if (packet.startsWith("X:")) {
       int idxX = packet.indexOf("X:");
       int idxY = packet.indexOf(",Y:");
+      int idxD = packet.indexOf(",D:");
 
-      int err_x = packet.substring(idxX + 2, idxY).toInt();
-      int err_y = packet.substring(idxY + 3).toInt();
+      if (idxY != -1) {
+        if (idxD != -1) {
+          // Format lengkap: "X:<x>,Y:<y>,D:<dist>"
+          targetErrX = packet.substring(idxX + 2, idxY).toInt();
+          targetErrY = packet.substring(idxY + 3, idxD).toInt();
+          cameraDistCm = packet.substring(idxD + 3).toInt();
+        } else {
+          // Format tanpa jarak: "X:<x>,Y:<y>"
+          targetErrX = packet.substring(idxX + 2, idxY).toInt();
+          targetErrY = packet.substring(idxY + 3).toInt();
+          cameraDistCm = 0;
+        }
 
-      targetLost = false;
-      lastPacketTime = millis();
+        targetLocked = true;
+        lastPacketTime = millis();
 
-      // 2. Kendali Proporsional Servo Pan (Horizontal)
-      // Jika target di kanan (err_x > 0), kamera harus menoleh ke kanan
-      // (Sesuaikan tanda minus/plus tergantung arah orientasi pemasangan servo Anda)
-      if (abs(err_x) > DEADZONE_PX) {
-        float deltaPan = - (err_x * KP_PAN);
-        currentPan += deltaPan;
-        currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
-        servoPan.write((int)currentPan);
-      }
+        // 2. KENDALI PROPORSIONAL SERVO PAN-TILT
+        // Pan: Jika target di kanan (ErrX > 0), putar servo ke kanan
+        if (abs(targetErrX) > DEADZONE_PX) {
+          float deltaPan = - (targetErrX * KP_PAN);
+          currentPan += deltaPan;
+          currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
+          servoPan.write((int)currentPan);
+        }
 
-      // 3. Kendali Proporsional Servo Tilt (Vertikal)
-      // Jika target di bawah (err_y > 0), kamera harus menunduk
-      if (abs(err_y) > DEADZONE_PX) {
-        float deltaTilt = (err_y * KP_TILT);
-        currentTilt += deltaTilt;
-        currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
-        servoTilt.write((int)currentTilt);
+        // Tilt: Jika target di bawah (ErrY > 0), tundukkan kamera
+        if (abs(targetErrY) > DEADZONE_PX) {
+          float deltaTilt = (targetErrY * KP_TILT);
+          currentTilt += deltaTilt;
+          currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
+          servoTilt.write((int)currentTilt);
+        }
       }
     }
   }
 
-  // 4. Safety Fail-Safe (Timeout Handler)
-  if (!targetLost && (millis() - lastPacketTime > TIMEOUT_MS)) {
-    targetLost = true;
-    // Pilihan: Biarkan di sudut terakhir atau perlahan kembali ke tengah
-    // currentPan = PAN_MID;
-    // servoPan.write(PAN_MID);
+  // 3. FAILSAFE TIMEOUT SERIAL
+  if (targetLocked && (millis() - lastPacketTime > SERIAL_TIMEOUT_MS)) {
+    targetLocked = false;
   }
 
-  delay(5); // Loop interval kecil
+  // 4. BACA SENSOR LASER VL53L0X (Jika Terpasang)
+  if (hasLaserSensor) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4) { // Status 4 = out of range
+      laserDistCm = measure.RangeMilliMeter / 10;
+    } else {
+      laserDistCm = -1; // Out of range (> 1.5 - 2m)
+    }
+  }
+
+  // 5. TENTUKAN JARAK EFEKTIF (Sensor Fusion: Prioritas Laser, Fallback Kamera)
+  int effectiveDistance = -1;
+  String distSource = "NONE";
+
+  if (hasLaserSensor && laserDistCm > 0 && laserDistCm < 200) {
+    effectiveDistance = laserDistCm;
+    distSource = "LASER";
+  } else if (cameraDistCm > 0) {
+    effectiveDistance = cameraDistCm;
+    distSource = "KAMERA";
+  }
+
+  // 6. LOGIKA KEPUTUSAN KENDALI SASIS (SESUAI PLAN_AI_MOBIL.md)
+  if (!targetLocked) {
+    currentAction = ACT_SEARCHING;
+  }
+  else if (effectiveDistance > 0 && effectiveDistance < 30) {
+    // Safety Cutoff Layer Mutlak: Jarak < 30 cm potong daya motor seketika!
+    currentAction = ACT_EMERGENCY_STOP;
+  }
+  else if (effectiveDistance >= 35 && effectiveDistance <= 60) {
+    // Jarak 35 - 60 cm: Mundur perlahan menjauh
+    currentAction = ACT_MUNDUR_MENJAUH;
+  }
+  else if (effectiveDistance >= 70 && effectiveDistance <= 90) {
+    // Jarak 70 - 90 cm: Zona tenang (Stop aman)
+    currentAction = ACT_STOP_ZONE_TENANG;
+  }
+  else if (effectiveDistance > 100) {
+    // Jarak > 100 cm: Maju mengejar proporsional
+    currentAction = ACT_MAJU_MENGEJAR;
+  }
+
+  // 7. TELEMETRI MONITOR BENCH TEST (Cetak tiap 250ms)
+  if (millis() - lastTelemetryPrint > 250) {
+    lastTelemetryPrint = millis();
+
+    Serial.print("[STATUS: ");
+    if (targetLocked) Serial.print("TERKUNCI ");
+    else Serial.print("MENCARI  ");
+    Serial.print("] ");
+
+    Serial.print("Pan:");
+    if (currentPan < 100) Serial.print(" ");
+    Serial.print((int)currentPan);
+    Serial.print("° Tilt:");
+    Serial.print((int)currentTilt);
+    Serial.print("° | ");
+
+    Serial.print("Jarak: ");
+    if (effectiveDistance > 0) {
+      Serial.print(effectiveDistance);
+      Serial.print(" cm (");
+      Serial.print(distSource);
+      Serial.print(") | ");
+    } else {
+      Serial.print("-- cm | ");
+    }
+
+    Serial.print("Aksi: ");
+    switch (currentAction) {
+      case ACT_EMERGENCY_STOP:
+        Serial.println("🛑 [EMERGENCY CUTOFF] (<30cm!)");
+        break;
+      case ACT_STOP_ZONE_TENANG:
+        Serial.println("🟢 [ZONA TENANG - STOP] (70-90cm)");
+        break;
+      case ACT_MAJU_MENGEJAR:
+        Serial.println("⬆️  [MAJU MENGEJAR] (>100cm)");
+        break;
+      case ACT_MUNDUR_MENJAUH:
+        Serial.println("⬇️  [MUNDUR MENJAUH] (35-60cm)");
+        break;
+      case ACT_SEARCHING:
+      default:
+        Serial.println("⚪ [STANDBY / TARGET LOST]");
+        break;
+    }
+  }
+
+  delay(5);
 }
