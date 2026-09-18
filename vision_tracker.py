@@ -24,7 +24,7 @@ import logging
 import subprocess
 import cv2
 import serial
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
@@ -129,8 +129,79 @@ def find_serial_port():
             pass
     return None
 
+def get_ai_face_detector():
+    """
+    Memuat model Neural Network OpenCV YuNet (ONNX, ~227KB):
+    Mampu mendeteksi wajah & manusia pada jarak jauh (hingga 4-5 meter),
+    pencahayaan minim / bayangan lampu plafon, dan berbagai sudut wajah,
+    dengan kecepatan sangat tinggi (~5-9 ms di STB ARM CPU).
+    """
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_detection_yunet_2023mar.onnx"),
+        "/usr/share/opencv4/face_detection_yunet_2023mar.onnx",
+        "/etc/stb_vision/face_detection_yunet_2023mar.onnx",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c) and hasattr(cv2, "FaceDetectorYN"):
+            try:
+                detector = cv2.FaceDetectorYN.create(
+                    model=c,
+                    config="",
+                    input_size=(FRAME_WIDTH, FRAME_HEIGHT),
+                    score_threshold=0.55,
+                    nms_threshold=0.3,
+                    top_k=5000
+                )
+                print(f"[AI DETECTOR] Model YuNet Neural Network berhasil dimuat dari: {c}")
+                return detector
+            except Exception as e:
+                print(f"[AI WARN] Gagal memuat YuNet ONNX: {e}")
+    return None
+
+def run_yunet_detection(detector, frame):
+    """Menjalankan inferensi YuNet AI pada frame."""
+    if detector is None:
+        return []
+    try:
+        detector.setInputSize((frame.shape[1], frame.shape[0]))
+        _, faces = detector.detect(frame)
+        if faces is not None and len(faces) > 0:
+            # Urutkan berdasarkan skor confidence * luas
+            faces = sorted(faces, key=lambda f: float(f[14]) * (float(f[2]) * float(f[3])), reverse=True)
+            res = []
+            for f in faces:
+                fx, fy, fw, fh, conf = int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[14])
+                if conf >= 0.48:
+                    res.append((fx, fy, fw, fh, conf))
+            return res
+    except Exception:
+        pass
+    return []
+
+def derive_body_box_from_face(fx, fy, fw, fh, profile_type="torso"):
+    """
+    Menghitung proporsi tubuh manusia presisi berdasarkan ukuran dan posisi wajah:
+    - Menghasilkan kotak yang presisi pada jarak dekat maupun sangat jauh (3-5 meter).
+    """
+    fcx = fx + fw // 2
+    if profile_type == "torso":
+        cw = max(32, min(FRAME_WIDTH, int(fw * 2.5)))
+        ch = max(42, min(FRAME_HEIGHT, int(fh * 3.3)))
+        top_y = fy + int(fh * 0.70)
+    elif profile_type == "body":
+        cw = max(40, min(FRAME_WIDTH, int(fw * 2.8)))
+        ch = max(70, min(FRAME_HEIGHT, int(fh * 6.5)))
+        top_y = max(0, fy - int(fh * 0.15))
+    else:  # face
+        cw, ch = int(fw * 1.2), int(fh * 1.3)
+        top_y = max(0, fy - int(fh * 0.1))
+
+    left_x = max(0, min(FRAME_WIDTH - cw, fcx - cw // 2))
+    top_y = max(0, min(FRAME_HEIGHT - ch, top_y))
+    return (left_x, top_y, cw, ch)
+
 def get_cascade_classifier():
-    """Mencari dan memuat file XML Haar Cascade Wajah secara tangguh."""
+    """Mencari dan memuat file XML Haar Cascade Wajah secara tangguh (fallback)."""
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "haarcascade_frontalface_default.xml"),
         os.path.join(getattr(cv2, "data", type('', (), {'haarcascades': ''})()).haarcascades or '', "haarcascade_frontalface_default.xml"),
@@ -203,15 +274,12 @@ def compare_clothes_color(frame, box, target_hist):
     except Exception:
         return 0.5
 
-def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, face_cascade=None, profile_type="torso"):
+def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detector=None, face_cascade=None, profile_type="torso"):
     """
-    Sistem Persistent Re-Identification (Re-ID) & Multi-Scale Auto-Snap:
-    Mencari kembali pemilik target di seluruh frame secara adaptif:
-    1. Jika wajah terdeteksi:
-       - Skala kotak badan disesuaikan langsung dengan ukuran wajah (jarak jauh = kotak mengecil otomatis).
-       - Kotak diposisikan tepat di dada/baju (bukan di dahi/rambut), terpusat di tengah badan.
-    2. Jika wajah tidak tampak (membelakangi kamera / tampak punggung):
-       - Memindai multi-skala (jauh, sedang, dekat) agar tetap dapat mengunci target meskipun menjauh.
+    Sistem Persistent Re-Identification (Re-ID) & AI Auto-Snap:
+    1. Prioritas 1: YuNet AI Neural Network (deteksi wajah & manusia di segala kondisi cahaya & jarak jauh 3-5m).
+    2. Prioritas 2: Haar Cascade Wajah (fallback jika YuNet tidak tersedia).
+    3. Prioritas 3: Full-Frame Multi-Scale Grid Scan (mencakup seluruh tinggi frame untuk tampak belakang/punggung).
     """
     if target_hist is None:
         return None, 0.0
@@ -219,65 +287,64 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, face_cascad
     best_box = None
     best_score = 0.0
 
-    # 1. Prioritas Pertama: Pencarian presisi berbasis deteksi wajah (Face-Guided Body Scaling)
+    # 1. Prioritas Utama: YuNet AI Neural Network Detector (~5-9 ms)
+    if yunet_detector:
+        ai_faces = run_yunet_detection(yunet_detector, frame)
+        if len(ai_faces) > 0:
+            for (fx, fy, fw, fh, conf) in ai_faces:
+                cand_box = derive_body_box_from_face(fx, fy, fw, fh, profile_type)
+                for dx in [-10, 0, 10]:
+                    cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
+                    test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
+                    s = compare_clothes_color(frame, test_b, target_hist)
+                    if s > best_score:
+                        best_score = s
+                        best_box = test_b
+
+            # Karena YuNet sudah mengonfirmasi keberadaan manusia asli dengan neural net,
+            # ambang verifikasi warna bisa fleksibel (>= 36%) jika target shirtless/berubah cahaya
+            if best_score >= 0.36:
+                return best_box, max(0.55, best_score)
+
+    # 2. Prioritas Kedua: Haar Cascade Fallback
     if face_cascade and not face_cascade.empty():
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
             if len(faces) > 0:
                 faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
-                for (fx, fy, fw, fh) in faces[:3]:
-                    fcx = fx + fw // 2
-                    if profile_type == "torso":
-                        cw = max(38, min(FRAME_WIDTH, int(fw * 2.4)))
-                        ch = max(48, min(FRAME_HEIGHT, int(fh * 3.2)))
-                        top_y = fy + int(fh * 0.72)
-                    elif profile_type == "body":
-                        cw = max(45, min(FRAME_WIDTH, int(fw * 2.7)))
-                        ch = max(75, min(FRAME_HEIGHT, int(fh * 6.5)))
-                        top_y = max(0, fy - int(fh * 0.15))
-                    else:  # face
-                        cw, ch = int(fw * 1.2), int(fh * 1.3)
-                        top_y = max(0, fy - int(fh * 0.1))
-
-                    # Cek titik tengah dan sedikit offset kiri-kanan untuk menemukan pusat baju yang sempurna
+                for (fx, fy, fw, fh) in faces[:2]:
+                    cand_box = derive_body_box_from_face(fx, fy, fw, fh, profile_type)
                     for dx in [-10, 0, 10]:
-                        cand_x = max(0, min(FRAME_WIDTH - cw, fcx - cw // 2 + dx))
-                        cand_y = max(0, min(FRAME_HEIGHT - ch, top_y))
-                        cand_box = (cand_x, cand_y, cw, ch)
-                        score = compare_clothes_color(frame, cand_box, target_hist)
-                        if score > best_score:
-                            best_score = score
-                            best_box = cand_box
+                        cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
+                        test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
+                        s = compare_clothes_color(frame, test_b, target_hist)
+                        if s > best_score:
+                            best_score = s
+                            best_box = test_b
 
-                if best_score >= 0.48:
+                if best_score >= 0.42:
                     return best_box, best_score
         except Exception:
             pass
 
-    # 2. Prioritas Kedua: Multi-Scale Grid Scan (untuk tampak belakang / orang membelakangi kamera)
-    # Memindai 3 skala jarak: 0.65x (jauh ~2.5-3.5m), 0.85x (sedang ~1.8-2.5m), 1.1x (dekat ~1.2m)
-    scales = [0.65, 0.85, 1.10]
+    # 3. Prioritas Ketiga: Full-Frame Multi-Scale Grid Scan (Mencakup seluruh area vertikal frame untuk tampak punggung)
+    scales = [0.55, 0.75, 1.0, 1.25]
     for s in scales:
-        cw = max(36, min(FRAME_WIDTH - 10, int(base_box_w * s)))
-        ch = max(48, min(FRAME_HEIGHT - 10, int(base_box_h * s)))
+        cw = max(32, min(FRAME_WIDTH - 10, int(base_box_w * s)))
+        ch = max(42, min(FRAME_HEIGHT - 10, int(base_box_h * s)))
         step_x = max(16, int(cw * 0.22))
-        y_center = max(0, min(FRAME_HEIGHT - ch, (FRAME_HEIGHT - ch) // 2))
-        y_cands = [y_center]
-        if y_center - 20 >= 0:
-            y_cands.append(y_center - 20)
-        if y_center + 20 <= FRAME_HEIGHT - ch:
-            y_cands.append(y_center + 20)
+        step_y = max(20, int(ch * 0.25))
 
         for x_cand in range(0, max(1, FRAME_WIDTH - cw + 1), step_x):
-            for y_cand in y_cands:
+            for y_cand in range(10, max(11, FRAME_HEIGHT - ch + 1), step_y):
                 cand_box = (x_cand, y_cand, cw, ch)
                 score = compare_clothes_color(frame, cand_box, target_hist)
                 if score > best_score:
                     best_score = score
                     best_box = cand_box
 
-    if best_score >= 0.48:
+    if best_score >= 0.45:
         return best_box, best_score
 
     return None, best_score
@@ -357,6 +424,7 @@ class VisionState:
         self.distance_status = "SEARCHING"
         self.anti_silau = True   # Default Anti-Silau WDR ON
         self.clothes_match_pct = 100
+        self.select_target_req = None  # Tuple (x, y) dari klik Web HUD
 
 vision_state = VisionState()
 
@@ -392,7 +460,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         .viewport-card { background: var(--card-bg); border-radius: 12px; border: 1px solid var(--border-color); overflow: hidden; display: flex; flex-direction: column; align-items: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
         .video-wrapper { position: relative; width: 100%; display: flex; justify-content: center; background: #000; }
-        .video-wrapper img { width: 100%; max-width: 640px; height: auto; aspect-ratio: 4/3; object-fit: contain; display: block; }
+        .video-wrapper img { width: 100%; max-width: 640px; height: auto; aspect-ratio: 4/3; object-fit: contain; display: block; cursor: crosshair; }
         
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; width: 100%; }
         .stat-card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 4px; }
@@ -429,7 +497,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
         <div class="viewport-card">
             <div class="video-wrapper">
-                <img id="stream" src="/video_feed" alt="Camera Stream" />
+                <img id="stream" src="/video_feed" alt="Camera Stream" title="Klik / Tap tubuh Anda pada video untuk mengunci target seketika!" />
+            </div>
+            <div style="background: rgba(88, 166, 255, 0.12); border-top: 1px solid rgba(88, 166, 255, 0.25); width: 100%; padding: 8px 14px; font-size: 0.80rem; color: #58a6ff; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <span>🎯</span>
+                <span><strong>Klik / Tap Tubuh Anda di Video:</strong> Langsung mengunci target seketika di posisi klik!</span>
             </div>
         </div>
 
@@ -662,6 +734,23 @@ HTML_PAGE = """<!DOCTYPE html>
                 .catch(e => console.error(e));
         }
 
+        const streamImg = document.getElementById('stream');
+        if (streamImg) {
+            streamImg.addEventListener('click', function(e) {
+                const rect = streamImg.getBoundingClientRect();
+                const clickX = e.clientX - rect.left;
+                const clickY = e.clientY - rect.top;
+                const normX = Math.max(0, Math.min(1, clickX / rect.width));
+                const normY = Math.max(0, Math.min(1, clickY / rect.height));
+                const frameX = Math.round(normX * 320);
+                const frameY = Math.round(normY * 240);
+                fetch('/api/select_target?x=' + frameX + '&y=' + frameY, { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => console.log('Target selected at:', frameX, frameY))
+                    .catch(err => console.error(err));
+            });
+        }
+
         setInterval(updateTelemetry, 250);
     </script>
 </body>
@@ -774,6 +863,17 @@ def create_app():
             return jsonify({"status": "ok", "mode": target_mode})
         return jsonify({"status": "error", "message": "Mode tidak valid"}), 400
 
+    @app.route('/api/select_target', methods=['POST', 'GET'])
+    def api_select_target():
+        try:
+            x = int(request.args.get('x', 160))
+            y = int(request.args.get('y', 120))
+            with vision_state.lock:
+                vision_state.select_target_req = (x, y)
+            return jsonify({"status": "ok", "target": [x, y]})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+
     return app
 
 def main():
@@ -878,8 +978,9 @@ def main():
     # Optimasi Hardware UVC Camera (Backlight Compensation, Anti-Silau & Anti-Flicker)
     configure_camera_hardware(cap, cam_device)
 
-    # Inisialisasi Detektor Wajah (selalu dimuat untuk membantu auto-snap badan & kalibrasi jarak)
+    # Inisialisasi Detektor Wajah (YuNet Neural Network + Haar Cascade Fallback)
     face_cascade = get_cascade_classifier()
+    yunet_detector = get_ai_face_detector()
 
     # Parameter Tracking Bounding Box & Target Profile
     current_profile = args.profile
@@ -980,6 +1081,63 @@ def main():
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Ganti mode ke '{current_mode.upper()}' dari Web HUD.")
 
+            # Cek perintah Click-to-Track manual dari Web HUD
+            with vision_state.lock:
+                req_click = vision_state.select_target_req
+                vision_state.select_target_req = None
+
+            if req_click is not None:
+                sel_x, sel_y = req_click
+                prof_info = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
+                clicked_box = None
+
+                # 1. Cocokkan dengan orang yang dideteksi YuNet AI di dekat titik klik
+                ai_faces = run_yunet_detection(yunet_detector, frame) if yunet_detector else []
+                for (fx, fy, fw, fh, conf) in ai_faces:
+                    p_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
+                    bx, by, bw, bh = p_box
+                    if (bx - 20 <= sel_x <= bx + bw + 20) and (by - 20 <= sel_y <= by + bh + 20):
+                        clicked_box = p_box
+                        break
+
+                # 2. Fallback Haar cascade
+                if clicked_box is None and face_cascade:
+                    try:
+                        gray_c = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        faces_c = face_cascade.detectMultiScale(gray_c, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                        for (fx, fy, fw, fh) in faces_c:
+                            p_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
+                            bx, by, bw, bh = p_box
+                            if (bx - 20 <= sel_x <= bx + bw + 20) and (by - 20 <= sel_y <= by + bh + 20):
+                                clicked_box = p_box
+                                break
+                    except Exception:
+                        pass
+
+                # 3. Jika diklik pada badan/baju yang membelakangi kamera (tampak punggung):
+                if clicked_box is None:
+                    base_w, base_h = prof_info["box"]
+                    scale = 0.60 if sel_y > 140 else 0.80
+                    cw = max(32, min(FRAME_WIDTH, int(base_w * scale)))
+                    ch = max(42, min(FRAME_HEIGHT, int(base_h * scale)))
+                    nx = max(0, min(FRAME_WIDTH - cw, sel_x - cw // 2))
+                    ny = max(0, min(FRAME_HEIGHT - ch, sel_y - ch // 2))
+                    clicked_box = (nx, ny, cw, ch)
+
+                tracker = create_tracker(current_mode)
+                if tracker:
+                    tracker.init(frame, clicked_box)
+                    target_clothes_hist = get_clothes_color_signature(frame, clicked_box)
+                    tracking_active = True
+                    target_box = list(clicked_box)
+                    mismatch_streak = 0
+                    with vision_state.lock:
+                        vision_state.clothes_match_pct = 100
+                    smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, clicked_box[3])
+                    status_text = "LOCKED_CLICK"
+                    status_color = (0, 255, 0)
+                    print(f"[CLICK-TO-TRACK] Target berhasil dikunci langsung pada: {clicked_box}")
+
             # --- METODE 1: TRACKER DENGAN AUTO-LOCK & PERSISTENT RE-ID ---
             if current_mode in ["kcf", "mosse"]:
                 now = time.time()
@@ -990,13 +1148,16 @@ def main():
                     # KASUS A: SUDAH ADA MEMORI WARNA/BENTUK PEMILIK (Persistent Re-ID)
                     # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame secara multi-skala!
                     if target_clothes_hist is not None:
-                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
-                        if re_box and re_score >= 0.48:
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
+                                                               yunet_detector=yunet_detector,
+                                                               face_cascade=face_cascade,
+                                                               profile_type=current_profile)
+                        if re_box and re_score >= 0.42:
                             tracker = create_tracker(current_mode)
                             if tracker:
                                 tracker.init(frame, re_box)
                                 tracking_active = True
-                                target_box = re_box
+                                target_box = list(re_box)
                                 mismatch_streak = 0
                                 initial_th = re_box[3]
                                 smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
@@ -1018,31 +1179,32 @@ def main():
                         remaining = countdown_duration - elapsed
                         center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
 
-                        # Smart Auto-Snap jika ada wajah pengguna (Posisikan tepat di dada/baju, bukan di dahi)
-                        if face_cascade and (now - last_face_scan > 0.12):
+                        # Smart AI Auto-Snap:
+                        # 1. Coba YuNet AI terlebih dahulu (mendeteksi orang di 3-5 meter sekalipun ada bayangan lampu plafon)
+                        # 2. Coba Haar cascade sebagai fallback
+                        if now - last_face_scan > 0.08:
                             last_face_scan = now
-                            gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                            faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=4, minSize=(22, 22))
-                            if len(faces_found) > 0:
-                                faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
-                                fx, fy, fw, fh = faces_found[0]
-                                fcx = fx + fw // 2
-                                if current_profile == "torso":
-                                    tw = max(38, min(FRAME_WIDTH, int(fw * 2.4)))
-                                    th = max(48, min(FRAME_HEIGHT, int(fh * 3.2)))
-                                    top_y = fy + int(fh * 0.72)
-                                elif current_profile == "body":
-                                    tw = max(45, min(FRAME_WIDTH, int(fw * 2.7)))
-                                    th = max(75, min(FRAME_HEIGHT, int(fh * 6.5)))
-                                    top_y = max(0, fy - int(fh * 0.15))
-                                else:
-                                    tw, th = int(fw * 1.2), int(fh * 1.3)
-                                    top_y = max(0, fy - int(fh * 0.1))
+                            ai_detected = False
+                            if yunet_detector:
+                                ai_faces = run_yunet_detection(yunet_detector, frame)
+                                if len(ai_faces) > 0:
+                                    fx, fy, fw, fh, _ = ai_faces[0]
+                                    active_lock_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
+                                    ai_detected = True
 
-                                left_x = max(0, min(FRAME_WIDTH - tw, fcx - tw // 2))
-                                top_y = max(0, min(FRAME_HEIGHT - th, top_y))
-                                active_lock_box = (left_x, top_y, tw, th)
-                            else:
+                            if not ai_detected and face_cascade:
+                                try:
+                                    gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                    faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                                    if len(faces_found) > 0:
+                                        faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
+                                        fx, fy, fw, fh = faces_found[0]
+                                        active_lock_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
+                                        ai_detected = True
+                                except Exception:
+                                    pass
+
+                            if not ai_detected and remaining <= 0:
                                 active_lock_box = center_box
 
                         if remaining > 0:
@@ -1054,7 +1216,7 @@ def main():
                             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
                             cv2.putText(annotated_frame, f"REKAM TARGET {prof_info['label']}: {remaining:.1f}s", (x, max(12, y - 8)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-                            cv2.putText(annotated_frame, "POSISIKAN DIRI DI DALAM KOTAK UNTUK MEREKAM", (10, FRAME_HEIGHT - 10),
+                            cv2.putText(annotated_frame, "POSISIKAN DIRI ATAU KLIK VIDEO UNTUK MENGUNCI", (10, FRAME_HEIGHT - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
                         else:
                             tracker = create_tracker(current_mode)
@@ -1062,6 +1224,8 @@ def main():
                                 tracker.init(frame, active_lock_box)
                                 target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
                                 tracking_active = True
+                                target_box = list(active_lock_box)
+                                mismatch_streak = 0
                                 with vision_state.lock:
                                     vision_state.clothes_match_pct = 100
                                 initial_th = active_lock_box[3]
@@ -1076,79 +1240,77 @@ def main():
                         target_box = [int(v) for v in box]
                         bx, by, bw, bh = target_box
 
-                        # 1. Anti-Bahu Drift (Centering Refinement):
-                        # Cek offset horizontal [-14, -7, 0, 7, 14] piksel
-                        # Memastikan kotak selalu menempel kuat di tengah dada/baju, bukan tergelincir ke ujung bahu saat ngereog
-                        raw_score = compare_clothes_color(frame, target_box, target_clothes_hist)
-                        offsets = [-14, -7, 7, 14]
-                        best_dx = 0
-                        best_s = raw_score
-                        for dx in offsets:
-                            tx = max(0, min(FRAME_WIDTH - bw, bx + dx))
-                            s = compare_clothes_color(frame, (tx, by, bw, bh), target_clothes_hist)
-                            if s > best_s:
-                                best_s = s
-                                best_dx = dx
+                        # 1. AI Anchor & Dynamic Scale Correction (Setiap 4 frame):
+                        # Menggunakan YuNet Neural Net untuk menjaga kotak tetap melekat di tengah badan,
+                        # mencegah kotak bergeser ke bahu saat bergerak cepat / ngereog,
+                        # dan menyesuaikan ukuran kotak secara presisi saat pengguna menjauh (3-5m) atau mendekat.
+                        ai_reanchored = False
+                        if yunet_detector and (frame_counter % 4 == 0):
+                            ai_faces = run_yunet_detection(yunet_detector, frame)
+                            for (fx, fy, fw, fh, conf) in ai_faces:
+                                ideal_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
+                                ix, iy, iw, ih = ideal_box
+                                fcx = fx + fw // 2
+                                tcx = bx + bw // 2
+                                # Wajah sejajar horizontal dengan target
+                                if abs(fcx - tcx) < max(bw, iw) * 0.85:
+                                    drift_x = abs(tcx - (ix + iw // 2))
+                                    scale_diff = abs(bw - iw) + abs(bh - ih)
+                                    if drift_x > 8 or scale_diff > 12:
+                                        new_w = max(30, min(FRAME_WIDTH, int(0.45 * bw + 0.55 * iw)))
+                                        new_h = max(40, min(FRAME_HEIGHT, int(0.45 * bh + 0.55 * ih)))
+                                        new_x = max(0, min(FRAME_WIDTH - new_w, int(0.45 * bx + 0.55 * ix)))
+                                        new_y = max(0, min(FRAME_HEIGHT - new_h, int(0.45 * by + 0.55 * iy)))
+                                        target_box = [new_x, new_y, new_w, new_h]
+                                        bx, by, bw, bh = target_box
+                                        tracker = create_tracker(current_mode)
+                                        if tracker:
+                                            tracker.init(frame, tuple(target_box))
+                                    ai_reanchored = True
+                                    break
 
-                        if best_dx != 0 and (best_s > raw_score + 0.03):
-                            new_x = max(0, min(FRAME_WIDTH - bw, bx + best_dx))
-                            target_box[0] = new_x
-                            bx = new_x
-                            match_score = best_s
-                            if abs(best_dx) >= 10:
-                                tracker = create_tracker(current_mode)
-                                if tracker:
-                                    tracker.init(frame, tuple(target_box))
+                        # 2. Anti-Bahu Drift via Color Histogram Symmetry:
+                        # Jika wajah tidak terlihat (misal tampak punggung), gunakan histogram warna
+                        # untuk memastikan kotak selalu berada di tengah baju, bukan di pinggir bahu
+                        if not ai_reanchored:
+                            raw_score = compare_clothes_color(frame, target_box, target_clothes_hist)
+                            offsets = [-12, -6, 6, 12]
+                            best_dx = 0
+                            best_s = raw_score
+                            for dx in offsets:
+                                tx = max(0, min(FRAME_WIDTH - bw, bx + dx))
+                                s = compare_clothes_color(frame, (tx, by, bw, bh), target_clothes_hist)
+                                if s > best_s:
+                                    best_s = s
+                                    best_dx = dx
+
+                            if best_dx != 0 and (best_s > raw_score + 0.03):
+                                new_x = max(0, min(FRAME_WIDTH - bw, bx + best_dx))
+                                target_box[0] = new_x
+                                bx = new_x
+                                match_score = best_s
+                                if abs(best_dx) >= 10:
+                                    tracker = create_tracker(current_mode)
+                                    if tracker:
+                                        tracker.init(frame, tuple(target_box))
+                            else:
+                                match_score = raw_score
                         else:
-                            match_score = raw_score
-
-                        # 2. Dynamic Scale Adaptation (Menjauh / Mendekat):
-                        # Jika ada deteksi wajah di sekitar target_box, sesuaikan skala kotak secara dinamis
-                        if face_cascade and (frame_counter % 6 == 0):
-                            try:
-                                gray_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                faces_near = face_cascade.detectMultiScale(gray_f, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
-                                for (fx, fy, fw, fh) in faces_near:
-                                    fcx = fx + fw // 2
-                                    if abs(fcx - (bx + bw // 2)) < bw * 0.75:
-                                        if current_profile == "torso":
-                                            ideal_w = int(fw * 2.4)
-                                            ideal_h = int(fh * 3.2)
-                                            top_y = fy + int(fh * 0.72)
-                                        elif current_profile == "body":
-                                            ideal_w = int(fw * 2.7)
-                                            ideal_h = int(fh * 6.5)
-                                            top_y = max(0, fy - int(fh * 0.15))
-                                        else:
-                                            ideal_w, ideal_h = int(fw * 1.2), int(fh * 1.3)
-                                            top_y = max(0, fy - int(fh * 0.1))
-
-                                        if abs(bw - ideal_w) > 12:
-                                            new_w = max(35, min(FRAME_WIDTH, int(0.65 * bw + 0.35 * ideal_w)))
-                                            new_h = max(45, min(FRAME_HEIGHT, int(0.65 * bh + 0.35 * ideal_h)))
-                                            new_x = max(0, min(FRAME_WIDTH - new_w, fcx - new_w // 2))
-                                            new_y = max(0, min(FRAME_HEIGHT - new_h, top_y))
-                                            target_box = [new_x, new_y, new_w, new_h]
-                                            tracker = create_tracker(current_mode)
-                                            if tracker:
-                                                tracker.init(frame, tuple(target_box))
-                                            break
-                            except Exception:
-                                pass
+                            match_score = compare_clothes_color(frame, target_box, target_clothes_hist)
 
                         clothes_pct = int(match_score * 100)
                         with vision_state.lock:
                             vision_state.clothes_match_pct = clothes_pct
 
                         # 3. Model Adaptation (EMA):
-                        # Jika kecocokan sangat tinggi (>= 70%), adaptasikan sedikit variasi pencahayaan
-                        if match_score >= 0.70:
+                        # Jika kecocokan sangat tinggi (>= 68%), adaptasikan sedikit variasi pencahayaan
+                        if match_score >= 0.68:
                             curr_hist = get_clothes_color_signature(frame, target_box)
                             if curr_hist is not None and target_clothes_hist is not None:
-                                target_clothes_hist = cv2.addWeighted(target_clothes_hist, 0.96, curr_hist, 0.04, 0)
+                                target_clothes_hist = cv2.addWeighted(target_clothes_hist, 0.95, curr_hist, 0.05, 0)
                                 cv2.normalize(target_clothes_hist, target_clothes_hist, alpha=1.0, norm_type=cv2.NORM_L1)
 
-                        if match_score >= 0.42:
+                        if match_score >= 0.38 or ai_reanchored:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
@@ -1157,34 +1319,38 @@ def main():
                             status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
                             status_color = (0, 165, 255)
 
-                            # Jika menempel ke objek salah (seperti monitor/dinding selama >= 5 frame):
+                            # Jika menempel ke objek salah (seperti monitor/dinding selama >= 4 frame):
                             # Langsung cari pemilik di seluruh frame secara multi-skala dan paksa kotaki kembali!
-                            if mismatch_streak >= 5:
-                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
-                                if re_box and re_score >= 0.48:
+                            if mismatch_streak >= 4:
+                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
+                                                                       yunet_detector=yunet_detector,
+                                                                       face_cascade=face_cascade,
+                                                                       profile_type=current_profile)
+                                if re_box and re_score >= 0.42:
                                     print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                     tracker = create_tracker(current_mode)
                                     tracker.init(frame, re_box)
-                                    target_box = re_box
+                                    target_box = list(re_box)
                                     mismatch_streak = 0
                                     status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                                     status_color = (0, 255, 0)
                                 else:
-                                    # Pemilik belum ketemu di frame saat ini
                                     tracking_active = False
                                     target_box = None
                                     status_text = "SCANNING_OWNER"
                                     status_color = (0, 165, 255)
                     else:
                         # Tracker lepas (misal gerakan cepat / ngereog):
-                        # Pindai frame untuk mencari pemilik sesuai memori secara multi-skala
-                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
-                        if re_box and re_score >= 0.48:
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
+                                                               yunet_detector=yunet_detector,
+                                                               face_cascade=face_cascade,
+                                                               profile_type=current_profile)
+                        if re_box and re_score >= 0.42:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
                             tracking_active = True
-                            target_box = re_box
+                            target_box = list(re_box)
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                             status_color = (0, 255, 0)
@@ -1195,11 +1361,17 @@ def main():
                             status_text = "SCANNING_OWNER"
                             status_color = (0, 0, 255)
 
-            # --- METODE 2: FACE DETECTOR (CASCADE) ---
+            # --- METODE 2: FACE DETECTOR (AI YUNET + CASCADE FALLBACK) ---
             elif current_mode == "face":
-                if face_cascade and not face_cascade.empty():
+                ai_faces = run_yunet_detection(yunet_detector, frame) if yunet_detector else []
+                if len(ai_faces) > 0:
+                    fx, fy, fw, fh, _ = ai_faces[0]
+                    target_box = (fx, fy, fw, fh)
+                    status_text = "AI_FACE_DETECTED"
+                    status_color = (0, 255, 0)
+                elif face_cascade and not face_cascade.empty():
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(30, 30))
+                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(22, 22))
                     if len(faces) > 0:
                         faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
                         target_box = faces[0]
@@ -1209,14 +1381,12 @@ def main():
                         status_text = "NO_FACE"
                         status_color = (0, 0, 255)
                 else:
-                    status_text = "CASCADE_ERR"
+                    status_text = "NO_DETECTOR"
                     status_color = (0, 0, 255)
 
             # Hitung Deviasi Piksel & Estimasi Jarak Monokular
             err_x = 0
             err_y = 0
-            # Target HANYA valid jika bounding box ada DAN bukan COLOR_MISMATCH berulang!
-            # Mencegah pengiriman serial dan pergerakan mobil menuju monitor/dinding yang salah.
             has_target = (target_box is not None) and (mismatch_streak < 3)
 
             if has_target:
@@ -1230,10 +1400,18 @@ def main():
 
                 # Hitung Jarak Monokular Aktual
                 if current_mode == "face":
-                    instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(10, th)
+                    instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(8, th)
                 else:
                     face_calibrated = False
-                    if face_cascade and (frame_counter % 8 == 0):
+                    if yunet_detector and (frame_counter % 5 == 0):
+                        ai_faces = run_yunet_detection(yunet_detector, frame)
+                        for (fx, fy, fw, fh, conf) in ai_faces:
+                            if abs((fx + fw // 2) - cx) < tw * 0.85:
+                                instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(8, fh)
+                                face_calibrated = True
+                                break
+
+                    if not face_calibrated and face_cascade and (frame_counter % 8 == 0):
                         roi_y1 = max(0, ty - int(th * 0.45))
                         roi_y2 = min(FRAME_HEIGHT, ty + int(th * 0.35))
                         roi_x1 = max(0, tx - 10)
