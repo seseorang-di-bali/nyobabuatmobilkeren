@@ -7,3 +7,6 @@ __pycache__/
 .idea/
 .venv/
 venv/
+*.mp4
+*.mov
+learned_servo_params.json

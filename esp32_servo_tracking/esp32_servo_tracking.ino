@@ -35,21 +35,22 @@
 const int PIN_SERVO_PAN  = 18;
 const int PIN_SERVO_TILT = 19;
 
-// Batasan Sudut Aman Servo (Mencegah gir SG90 mentok / rusak)
+// Batasan Sudut Aman Servo (Mencegah gir SG90/MG996R mentok / rusak)
 const float PAN_MIN  = 20.0;
 const float PAN_MAX  = 160.0;
 const float PAN_MID  = 90.0;
 
-const float TILT_MIN = 50.0;
-const float TILT_MAX = 130.0;
+const float TILT_MIN = 60.0;  // Batasi agar tidak mendongak/menunduk terlalu ekstrem
+const float TILT_MAX = 120.0;
 const float TILT_MID = 90.0;
 
 // Parameter Kendali Servo Proporsional & Anti-Sentak (Smooth Slew-Rate Limiter)
-const int DEADZONE_PX       = 18;    // Zona toleransi anti-jitter (piksel)
-const float KP_PAN          = 0.020; // Kecepatan belok Pan (dihaluskan dari 0.04)
-const float KP_TILT         = 0.015; // Kecepatan Tilt (dihaluskan dari 0.03)
-const float MAX_STEP_PAN    = 1.5;   // Maksimal perubahan sudut Pan per packet (derajat) - Anti-Reog!
-const float MAX_STEP_TILT   = 1.0;   // Maksimal perubahan sudut Tilt per packet
+const int DEADZONE_PAN_PX   = 14;    // Zona toleransi anti-jitter horizontal (piksel)
+const int DEADZONE_TILT_PX  = 22;    // Zona toleransi vertikal lebih lebar (kamera tenang di horizon)
+const float KP_PAN          = 0.016; // Kecepatan belok Pan halus
+const float KP_TILT         = 0.007; // Kecepatan Tilt sangat lembut & tenang (anti-reog vertikal!)
+const float MAX_STEP_PAN    = 1.0;   // Maksimal 1.0 derajat per packet
+const float MAX_STEP_TILT   = 0.35;  // Maksimal 0.35 derajat per packet untuk vertikal (super tenang)
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
 // Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)
@@ -154,7 +155,7 @@ void processPacket(char* pkt) {
 
       // 2. KENDALI PROPORSIONAL SERVO PAN-TILT DENGAN SLEW-RATE LIMITER (ANTI-SENTAK)
       // Pan: Belokkan servo menuju posisi target horizontal
-      if (abs(targetErrX) > DEADZONE_PX) {
+      if (abs(targetErrX) > DEADZONE_PAN_PX) {
         float dirPan = INVERT_PAN ? 1.0 : -1.0;
         float deltaPan = dirPan * (targetErrX * KP_PAN);
         // Batasi percepatan putar servo per frame agar gerakan halus dan tidak bergetar (anti-reog)
@@ -164,8 +165,8 @@ void processPacket(char* pkt) {
         servoPan.write((int)currentPan);
       }
 
-      // Tilt: Arahkan kamera vertikal (nunduk/mendongak)
-      if (abs(targetErrY) > DEADZONE_PX) {
+      // Tilt: Arahkan kamera vertikal (nunduk/mendongak) - Sangat Tenang & Lembut
+      if (abs(targetErrY) > DEADZONE_TILT_PX) {
         float dirTilt = INVERT_TILT ? -1.0 : 1.0;
         float deltaTilt = dirTilt * (targetErrY * KP_TILT);
         deltaTilt = constrain(deltaTilt, -MAX_STEP_TILT, MAX_STEP_TILT);

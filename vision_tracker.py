@@ -736,13 +736,12 @@ class ThreadedCamera:
 
 class OnlineServoLearner:
     """
-    Sistem Pembelajaran Gerakan Servo Mandiri Saat Berjalan (Ultra-Lightweight Online Learning):
-    - Berjalan real-time di STB Armbian tanpa membebani CPU (kompleksitas O(1), <0.005 ms per frame).
-    - Mengevaluasi performa pelacakan per episode (1.5 detik / 45 frame):
-      * Menghitung Loss (Rata-rata error jarak piksel, frekuensi osilasi/overshoot, dan getaran jitter).
-      * Menghitung Efisiensi Reward (10% - 99%).
-    - Melakukan adaptasi gradien parameter (Kecepatan respon Kp & Kelembutan damping EMA).
-    - Menyimpan parameter terbaik ke 'learned_servo_params.json' agar tetap diingat setelah STB restart.
+    Sistem Pembelajaran Mandiri Gerakan Servo Berkelanjutan (Continuous Online Learning):
+    - Berjalan real-time di STB Armbian tanpa membebani CPU (O(1), <0.005 ms per frame).
+    - Memisahkan kendali Horizontal (Pan) dan Vertikal (Tilt) dengan batas kecepatan independen.
+    - Vertikal sengaja dibuat jauh lebih tenang & stabil (Anti-Nunduk/Mendongak liar).
+    - Parameter terus dilatih dan diakumulasikan sepanjang masa, tidak pernah dihapus/dibuang.
+    - Parameter terbaik otomatis disimpan ke 'learned_servo_params.json'.
     """
     def __init__(self, config_file="learned_servo_params.json"):
         self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_file)
@@ -751,18 +750,24 @@ class OnlineServoLearner:
         self.status = "MENUNGGU TARGET"
         self.metrics_str = "Loss: - | R: -"
 
-        # Parameter default jika belum ada file terlatih
-        self.learned_speed = 38
-        self.learned_smooth = 72
-        self.learned_deadzone = 12
+        # Parameter default awal (Tenang, Stabil, Bebas Sentak)
+        self.learned_speed_pan = 35       # Kecepatan Pan horizontal (default 35%)
+        self.learned_speed_tilt = 18      # Kecepatan Tilt vertikal (sangat pelan 18% - Anti-Reog Vertikal!)
+        self.learned_smooth = 78          # Kelembutan EMA (78% sangat halus)
+        self.learned_deadzone_x = 14      # Deadzone horizontal (14 px)
+        self.learned_deadzone_y = 22      # Deadzone vertikal lebar (22 px) agar kamera tidak mudah goyang naik-turun
 
         # Buffer pengumpul metrik per-episode
         self.frame_count = 0
-        self.sum_abs_err = 0.0
-        self.sum_d_err = 0.0
-        self.prev_err = 0.0
-        self.overshoot_count = 0
-        self.last_sign = 0
+        self.sum_abs_x = 0.0
+        self.sum_abs_y = 0.0
+        self.sum_d_x = 0.0
+        self.prev_err_x = 0.0
+        self.prev_err_y = 0.0
+        self.overshoot_x = 0
+        self.overshoot_y = 0
+        self.last_sign_x = 0
+        self.last_sign_y = 0
         self.episode_start = time.time()
         self.is_trained = False
 
@@ -773,22 +778,28 @@ class OnlineServoLearner:
             if os.path.exists(self.config_path):
                 with open(self.config_path, "r") as f:
                     data = json.load(f)
-                    self.learned_speed = int(data.get("servo_speed_pct", 38))
-                    self.learned_smooth = int(data.get("servo_smoothing_pct", 72))
-                    self.learned_deadzone = int(data.get("deadzone", 12))
+                    self.learned_speed_pan = int(data.get("servo_speed_pct", data.get("servo_speed_pan_pct", 35)))
+                    self.learned_speed_tilt = int(data.get("servo_speed_tilt_pct", 18))
+                    self.learned_smooth = int(data.get("servo_smoothing_pct", 78))
+                    self.learned_deadzone_x = int(data.get("deadzone_x", data.get("deadzone", 14)))
+                    self.learned_deadzone_y = int(data.get("deadzone_y", 22))
                     self.best_loss = float(data.get("best_loss", 999.0))
                     self.iteration = int(data.get("iteration", 0))
                     self.is_trained = bool(data.get("trained", False))
-                    print(f"[AI LEARNER] Memuat parameter terlatih: Speed={self.learned_speed}%, Smooth={self.learned_smooth}%, Deadzone={self.learned_deadzone}px (Best Loss: {self.best_loss:.1f})")
+                    print(f"[AI LEARNER] Memuat parameter terlatih: Pan={self.learned_speed_pan}%, Tilt={self.learned_speed_tilt}%, Smooth={self.learned_smooth}% (Best Loss: {self.best_loss:.1f}, Iterasi: {self.iteration})")
         except Exception as e:
             print(f"[AI LEARNER] Info load config: {e}")
 
     def save_learned_params(self):
         try:
             data = {
-                "servo_speed_pct": int(self.learned_speed),
+                "servo_speed_pct": int(self.learned_speed_pan),
+                "servo_speed_pan_pct": int(self.learned_speed_pan),
+                "servo_speed_tilt_pct": int(self.learned_speed_tilt),
                 "servo_smoothing_pct": int(self.learned_smooth),
-                "deadzone": int(self.learned_deadzone),
+                "deadzone_x": int(self.learned_deadzone_x),
+                "deadzone_y": int(self.learned_deadzone_y),
+                "deadzone": int(self.learned_deadzone_x),
                 "best_loss": float(round(self.best_loss, 2)),
                 "iteration": int(self.iteration),
                 "trained": True,
@@ -796,95 +807,120 @@ class OnlineServoLearner:
             }
             with open(self.config_path, "w") as f:
                 json.dump(data, f, indent=2)
-            print(f"[AI LEARNER] Parameter gerakan terbaik disimpan ke {self.config_path}!")
+            print(f"[AI LEARNER] Pembelajaran tersimpan! Iterasi #{self.iteration}, Best Loss: {self.best_loss:.1f}")
         except Exception as e:
             print(f"[AI LEARNER] Gagal menyimpan parameter: {e}")
 
-    def step(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
+    def step(self, err_x, err_y, cur_spd_pan, cur_spd_tilt, cur_smooth, is_auto_tune_enabled):
         """
-        Dijalankan setiap frame (0.002 ms).
-        Mengumpulkan data pergerakan dan memperbarui kebijakan servo setiap ~45 frame.
+        Evaluasi per-frame dan adaptasi per-episode (1.5 detik / 45 frame).
+        Pembelajaran terus berjalan secara kontinu tanpa pernah menghapus ingatan sebelumnya.
         """
         if not is_auto_tune_enabled:
             self.status = "MANUAL CONTROL"
             self.metrics_str = "AI Nonaktif"
-            return current_speed_pct, current_smooth_pct, self.learned_deadzone, self.status, self.metrics_str
+            return cur_spd_pan, cur_spd_tilt, cur_smooth, self.learned_deadzone_x, self.learned_deadzone_y, self.status, self.metrics_str
 
         now = time.time()
-        abs_err = abs(err_x)
-        d_err = abs(err_x - self.prev_err)
-        curr_sign = 1 if err_x > 6 else (-1 if err_x < -6 else 0)
+        abs_x = abs(err_x)
+        abs_y = abs(err_y)
+        d_x = abs(err_x - self.prev_err_x)
 
-        # Deteksi pembalikan arah (overshoot / osilasi bolak-balik melintasi target)
-        if self.last_sign != 0 and curr_sign != 0 and curr_sign != self.last_sign:
-            self.overshoot_count += 1
+        sign_x = 1 if err_x > 6 else (-1 if err_x < -6 else 0)
+        sign_y = 1 if err_y > 8 else (-1 if err_y < -8 else 0)
 
-        self.last_sign = curr_sign
-        self.prev_err = err_x
+        # Hitung osilasi bolak-balik horizontal (overshoot pan)
+        if self.last_sign_x != 0 and sign_x != 0 and sign_x != self.last_sign_x:
+            self.overshoot_x += 1
 
-        self.sum_abs_err += abs_err
-        self.sum_d_err += d_err
+        # Hitung osilasi bolak-balik vertikal (overshoot tilt / angguk-angguk liar)
+        if self.last_sign_y != 0 and sign_y != 0 and sign_y != self.last_sign_y:
+            self.overshoot_y += 1
+
+        self.last_sign_x = sign_x
+        self.last_sign_y = sign_y
+        self.prev_err_x = err_x
+        self.prev_err_y = err_y
+
+        self.sum_abs_x += abs_x
+        self.sum_abs_y += abs_y
+        self.sum_d_x += d_x
         self.frame_count += 1
 
         # Evaluasi episode setiap ~45 frame (~1.5 detik berjalan)
         if self.frame_count >= 45 or (now - self.episode_start > 1.6):
-            mae = self.sum_abs_err / max(1, self.frame_count)
-            jitter = self.sum_d_err / max(1, self.frame_count)
-            overshoots = self.overshoot_count
+            mae_x = self.sum_abs_x / max(1, self.frame_count)
+            mae_y = self.sum_abs_y / max(1, self.frame_count)
+            jitter_x = self.sum_d_x / max(1, self.frame_count)
+            over_x = self.overshoot_x
+            over_y = self.overshoot_y
 
-            # Fungsi Loss: Gabungan deviasi jarak, penalti osilasi/reog, dan getaran jitter
-            loss = round(0.40 * mae + 15.0 * overshoots + 0.35 * jitter, 1)
+            # Fungsi Loss terintegrasi: deviasi, getaran, dan penalti keras osilasi vertikal
+            loss = round(0.35 * mae_x + 0.20 * mae_y + 12.0 * over_x + 18.0 * over_y + 0.30 * jitter_x, 1)
             reward_pct = max(10, min(99, int(100 - loss)))
             self.iteration += 1
 
-            new_speed = current_speed_pct
-            new_smooth = current_smooth_pct
-            new_deadzone = self.learned_deadzone
+            new_spd_pan = cur_spd_pan
+            new_spd_tilt = cur_spd_tilt
+            new_smooth = cur_smooth
+            new_dz_x = self.learned_deadzone_x
+            new_dz_y = self.learned_deadzone_y
 
-            # 1. Adaptasi Anti-Overshoot: Jika servo bergoyang bolak-balik melewati majikan
-            if overshoots >= 2:
-                new_speed = max(16, current_speed_pct - 4)
-                new_smooth = min(88, current_smooth_pct + 3)
-                action_desc = "REDAM OSILASI"
+            action_notes = []
 
-            # 2. Adaptasi Respons Lambat: Jika error masih besar tapi tidak ada osilasi sama sekali
-            elif mae > 26.0 and overshoots <= 1:
-                new_speed = min(68, current_speed_pct + 3)
-                new_smooth = max(35, current_smooth_pct - 2)
-                action_desc = "BOOST RESPON"
+            # 1. Adaptasi Vertikal: Jika tilt mengangguk atau goyang atas-bawah
+            if over_y >= 1:
+                new_spd_tilt = max(10, cur_spd_tilt - 3)
+                new_dz_y = min(28, new_dz_y + 2)
+                action_notes.append("REDAM TILT")
+            elif mae_y > 30.0 and over_y == 0:
+                new_spd_tilt = min(26, cur_spd_tilt + 1)
 
-            # 3. Adaptasi Anti-Jitter Dekat: Jika target sudah di tengah tapi servo bergetar halus
-            elif mae < 10.0 and jitter > 5.0:
-                new_deadzone = min(18, new_deadzone + 1)
-                action_desc = "DEADZONE +1px"
+            # 2. Adaptasi Horizontal: Jika pan melesat bolak-balik melewati badan
+            if over_x >= 2:
+                new_spd_pan = max(16, cur_spd_pan - 4)
+                new_smooth = min(88, cur_smooth + 3)
+                action_notes.append("REDAM PAN")
+            elif mae_x > 26.0 and over_x <= 1:
+                new_spd_pan = min(60, cur_spd_pan + 2)
+                new_smooth = max(45, cur_smooth - 2)
+                action_notes.append("BOOST PAN")
+            elif mae_x < 10.0 and jitter_x > 5.0:
+                new_dz_x = min(18, new_dz_x + 1)
+                action_notes.append("DZ+1")
 
-            # 4. Kinerja Optimal Tercapai
-            else:
-                action_desc = "PAS & STABIL"
+            action_desc = " & ".join(action_notes) if action_notes else "PAS & STABIL"
+
+            # Simpan jika ada peningkatan kualitas gerakan atau berkala
+            if loss < self.best_loss or (self.iteration % 10 == 0):
                 if loss < self.best_loss:
                     self.best_loss = loss
-                    self.learned_speed = new_speed
-                    self.learned_smooth = new_smooth
-                    self.learned_deadzone = new_deadzone
-                    self.save_learned_params()
+                self.learned_speed_pan = new_spd_pan
+                self.learned_speed_tilt = new_spd_tilt
+                self.learned_smooth = new_smooth
+                self.learned_deadzone_x = new_dz_x
+                self.learned_deadzone_y = new_dz_y
+                self.save_learned_params()
 
             self.status = f"TRAINING #{self.iteration} | {action_desc}"
             self.metrics_str = f"Loss: {loss} | R: {reward_pct}%"
 
-            # Reset akumulator untuk episode berikutnya
+            # Reset hanya accumulator stopwatch episode, TIDAK mereset parameter yang dipelajari
             self.frame_count = 0
-            self.sum_abs_err = 0.0
-            self.sum_d_err = 0.0
-            self.overshoot_count = 0
+            self.sum_abs_x = 0.0
+            self.sum_abs_y = 0.0
+            self.sum_d_x = 0.0
+            self.overshoot_x = 0
+            self.overshoot_y = 0
             self.episode_start = now
 
-            return new_speed, new_smooth, new_deadzone, self.status, self.metrics_str
+            return new_spd_pan, new_spd_tilt, new_smooth, new_dz_x, new_dz_y, self.status, self.metrics_str
 
-        return current_speed_pct, current_smooth_pct, self.learned_deadzone, self.status, self.metrics_str
+        return cur_spd_pan, cur_spd_tilt, cur_smooth, self.learned_deadzone_x, self.learned_deadzone_y, self.status, self.metrics_str
 
     def update(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
-        spd, sm, dz, st, met = self.step(err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled)
-        return spd, sm, st
+        p, t, sm, dzx, dzy, st, met = self.step(err_x, 0, current_speed_pct, 18, current_smooth_pct, is_auto_tune_enabled)
+        return p, sm, st
 
 AdaptiveServoTuner = OnlineServoLearner
 
@@ -908,10 +944,14 @@ class VisionState:
         self.mirror = False      # Default mirror OFF (orientasi nyata dunia robot)
         self.flip_v = False      # Flip vertikal (jika kamera terbalik atas-bawah)
         self.invert_pan = False  # Invert arah putaran servo Pan horizontal
-        self.invert_tilt = False # Invert arah putaran servo Tilt vertikal
-        self.servo_speed_pct = 38       # Kecepatan respon servo (default 38% halus)
-        self.servo_smoothing_pct = 72   # Kelembutan EMA (default 72% sinematik)
-        self.servo_deadzone = 12        # Deadzone pixel anti-jitter
+        self.servo_speed_pct = 35       # Kecepatan respon Pan horizontal (default 35%)
+        self.servo_speed_tilt_pct = 18  # Kecepatan respon Tilt vertikal (default 18% - sangat tenang)
+        self.servo_smoothing_pct = 78   # Kelembutan EMA (default 78% sinematik)
+        self.servo_deadzone_x = 14      # Deadzone horizontal anti-jitter (14 px)
+        self.servo_deadzone_y = 22      # Deadzone vertikal lebar (22 px - anti-angguk liar)
+        self.servo_deadzone = 14        # Kompatibilitas
+        self.servo_max_step_pan = 8     # Slew-rate limiter Pan (maks 8 px/frame)
+        self.servo_max_step_tilt = 3    # Slew-rate limiter Tilt (maks 3 px/frame - super tenang!)
         self.auto_tune = True           # AI Online Learning aktif
         self.auto_tune_status = "MENUNGGU TARGET"
         self.auto_tune_metrics = "Loss: - | R: -"
@@ -1078,13 +1118,17 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="control-panel">
             <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PENGATUR KECEPATAN & AI ONLINE LEARNING SERVO:</span>
             <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center; margin-top: 8px;">
-                <div style="flex: 1; min-width: 180px;">
-                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan: <span id="val-speed" style="color: var(--accent-color); font-weight: bold;">38%</span></label>
-                    <input type="range" id="slider-speed" min="10" max="100" value="38" style="width: 100%; cursor: pointer;" oninput="changeServoSpeed(this.value)">
+                <div style="flex: 1; min-width: 140px;">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan Pan (Kiri/Kanan): <span id="val-speed" style="color: var(--accent-color); font-weight: bold;">35%</span></label>
+                    <input type="range" id="slider-speed" min="10" max="80" value="35" style="width: 100%; cursor: pointer;" oninput="changeServoSpeed(this.value)">
                 </div>
-                <div style="flex: 1; min-width: 180px;">
-                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kelembutan (Anti-Sentak): <span id="val-smooth" style="color: var(--success-color); font-weight: bold;">72%</span></label>
-                    <input type="range" id="slider-smooth" min="10" max="90" value="72" style="width: 100%; cursor: pointer;" oninput="changeServoSmooth(this.value)">
+                <div style="flex: 1; min-width: 140px;">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan Tilt (Vertikal): <span id="val-speed-tilt" style="color: #e3b341; font-weight: bold;">18%</span></label>
+                    <input type="range" id="slider-speed-tilt" min="5" max="50" value="18" style="width: 100%; cursor: pointer;" oninput="changeServoTiltSpeed(this.value)">
+                </div>
+                <div style="flex: 1; min-width: 140px;">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kelembutan (Anti-Sentak): <span id="val-smooth" style="color: var(--success-color); font-weight: bold;">78%</span></label>
+                    <input type="range" id="slider-smooth" min="20" max="95" value="78" style="width: 100%; cursor: pointer;" oninput="changeServoSmooth(this.value)">
                 </div>
                 <div>
                     <button id="btn-toggle-autotune" class="btn-primary" onclick="toggleAutoTune()">🧠 AI Learning: ON</button>
@@ -1150,6 +1194,13 @@ HTML_PAGE = """<!DOCTYPE html>
             isDraggingSlider = true;
             document.getElementById('val-speed').innerText = val + '%';
             fetch('/api/servo_speed?val=' + val, { method: 'POST' })
+                .finally(() => setTimeout(() => { isDraggingSlider = false; }, 800));
+        }
+
+        function changeServoTiltSpeed(val) {
+            isDraggingSlider = true;
+            document.getElementById('val-speed-tilt').innerText = val + '%';
+            fetch('/api/servo_tilt_speed?val=' + val, { method: 'POST' })
                 .finally(() => setTimeout(() => { isDraggingSlider = false; }, 800));
         }
 
@@ -1299,10 +1350,15 @@ HTML_PAGE = """<!DOCTYPE html>
                     }
                     if (!isDraggingSlider) {
                         const sSpeed = document.getElementById('slider-speed');
+                        const sSpeedTilt = document.getElementById('slider-speed-tilt');
                         const sSmooth = document.getElementById('slider-smooth');
                         if (sSpeed && data.servo_speed_pct !== undefined) {
                             sSpeed.value = data.servo_speed_pct;
                             document.getElementById('val-speed').innerText = data.servo_speed_pct + '%';
+                        }
+                        if (sSpeedTilt && data.servo_speed_tilt_pct !== undefined) {
+                            sSpeedTilt.value = data.servo_speed_tilt_pct;
+                            document.getElementById('val-speed-tilt').innerText = data.servo_speed_tilt_pct + '%';
                         }
                         if (sSmooth && data.servo_smoothing_pct !== undefined) {
                             sSmooth.value = data.servo_smoothing_pct;
@@ -1392,8 +1448,11 @@ def create_app():
                 "flip_v": bool(vision_state.flip_v),
                 "invert_pan": bool(vision_state.invert_pan),
                 "servo_speed_pct": int(vision_state.servo_speed_pct),
+                "servo_speed_tilt_pct": int(vision_state.servo_speed_tilt_pct),
                 "servo_smoothing_pct": int(vision_state.servo_smoothing_pct),
                 "servo_deadzone": int(vision_state.servo_deadzone),
+                "servo_deadzone_x": int(vision_state.servo_deadzone_x),
+                "servo_deadzone_y": int(vision_state.servo_deadzone_y),
                 "auto_tune": bool(vision_state.auto_tune),
                 "auto_tune_status": str(vision_state.auto_tune_status),
                 "auto_tune_metrics": str(vision_state.auto_tune_metrics),
@@ -1443,11 +1502,22 @@ def create_app():
     @app.route('/api/servo_speed', methods=['POST', 'GET'])
     def api_servo_speed():
         try:
-            val = int(request.args.get('val', 40))
+            val = int(request.args.get('val', 35))
             val = max(10, min(100, val))
             with vision_state.lock:
                 vision_state.servo_speed_pct = val
             return jsonify({"status": "ok", "servo_speed_pct": val})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+
+    @app.route('/api/servo_tilt_speed', methods=['POST', 'GET'])
+    def api_servo_tilt_speed():
+        try:
+            val = int(request.args.get('val', 18))
+            val = max(5, min(60, val))
+            with vision_state.lock:
+                vision_state.servo_speed_tilt_pct = val
+            return jsonify({"status": "ok", "servo_speed_tilt_pct": val})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 400
 
@@ -1614,10 +1684,15 @@ def main():
     servo_learner = OnlineServoLearner()
     # Muat parameter yang sudah dipelajari sebelumnya jika ada
     with vision_state.lock:
-        vision_state.servo_speed_pct = servo_learner.learned_speed
+        vision_state.servo_speed_pct = servo_learner.learned_speed_pan
+        vision_state.servo_speed_tilt_pct = servo_learner.learned_speed_tilt
         vision_state.servo_smoothing_pct = servo_learner.learned_smooth
-        vision_state.servo_deadzone = servo_learner.learned_deadzone
+        vision_state.servo_deadzone_x = servo_learner.learned_deadzone_x
+        vision_state.servo_deadzone_y = servo_learner.learned_deadzone_y
+        vision_state.servo_deadzone = servo_learner.learned_deadzone_x
 
+    prev_send_x = 0
+    prev_send_y = 0
     prev_gray_frame = None
 
     print("[SYSTEM] Pipeline kamera aktif. Memulai pelacakan...\n")
@@ -2214,46 +2289,75 @@ def main():
             # Transmisi Serial Asinkronus ke ESP32 (0.00 ms, tidak pernah memblokir FPS)
             now_time = time.time()
             if has_target:
-                # 1. Update AI Online Learning (Self-training anti-overshoot & anti-jitter)
+                # 1. Update AI Online Learning (Self-training anti-overshoot horizontal & vertikal)
                 with vision_state.lock:
                     is_autotune = vision_state.auto_tune
-                    cur_speed = vision_state.servo_speed_pct
+                    cur_speed_pan = vision_state.servo_speed_pct
+                    cur_speed_tilt = vision_state.servo_speed_tilt_pct
                     cur_smooth = vision_state.servo_smoothing_pct
-                    deadzone = vision_state.servo_deadzone
+                    deadzone_x = vision_state.servo_deadzone_x
+                    deadzone_y = vision_state.servo_deadzone_y
+                    max_step_pan = vision_state.servo_max_step_pan
+                    max_step_tilt = vision_state.servo_max_step_tilt
 
                 if is_autotune:
-                    new_spd, new_sm, new_dz, tune_status, metrics_str = servo_learner.step(err_x, cur_speed, cur_smooth, True)
-                    if (new_spd != cur_speed or new_sm != cur_smooth or new_dz != deadzone
+                    new_spd_p, new_spd_t, new_sm, new_dz_x, new_dz_y, tune_status, metrics_str = servo_learner.step(
+                        err_x, err_y, cur_speed_pan, cur_speed_tilt, cur_smooth, True
+                    )
+                    if (new_spd_p != cur_speed_pan or new_spd_t != cur_speed_tilt or new_sm != cur_smooth
+                            or new_dz_x != deadzone_x or new_dz_y != deadzone_y
                             or tune_status != vision_state.auto_tune_status or metrics_str != vision_state.auto_tune_metrics):
                         with vision_state.lock:
-                            vision_state.servo_speed_pct = new_spd
+                            vision_state.servo_speed_pct = new_spd_p
+                            vision_state.servo_speed_tilt_pct = new_spd_t
                             vision_state.servo_smoothing_pct = new_sm
-                            vision_state.servo_deadzone = new_dz
+                            vision_state.servo_deadzone_x = new_dz_x
+                            vision_state.servo_deadzone_y = new_dz_y
+                            vision_state.servo_deadzone = new_dz_x
                             vision_state.auto_tune_status = tune_status
                             vision_state.auto_tune_metrics = metrics_str
-                        cur_speed, cur_smooth, deadzone = new_spd, new_sm, new_dz
+                        cur_speed_pan, cur_speed_tilt, cur_smooth = new_spd_p, new_spd_t, new_sm
+                        deadzone_x, deadzone_y = new_dz_x, new_dz_y
 
                 # 2. Filter Exponential Moving Average (EMA) - Mengubah sentakan kasar jadi luncuran halus
-                alpha = max(0.10, min(0.60, 1.0 - (cur_smooth / 100.0) * 0.85))
-                smooth_err_x = alpha * err_x + (1.0 - alpha) * smooth_err_x
-                smooth_err_y = alpha * err_y + (1.0 - alpha) * smooth_err_y
+                # Vertikal menggunakan koefisien yang jauh lebih lambat (redaman kuat agar tidak nunduk/dongak liar)
+                alpha_x = max(0.10, min(0.60, 1.0 - (cur_smooth / 100.0) * 0.85))
+                alpha_y = max(0.04, min(0.25, alpha_x * 0.40))
 
-                # 3. Dynamic Deadzone: Mencegah servo bergetar saat target sudah dekat di tengah
-                dead_x = smooth_err_x if abs(smooth_err_x) > deadzone else 0.0
-                dead_y = smooth_err_y if abs(smooth_err_y) > deadzone else 0.0
+                smooth_err_x = alpha_x * err_x + (1.0 - alpha_x) * smooth_err_x
+                smooth_err_y = alpha_y * err_y + (1.0 - alpha_y) * smooth_err_y
 
-                # 4. Pengali Kecepatan Respon (cur_speed: 10% - 100% -> scale: 0.15 - 1.0)
-                speed_factor = max(0.15, min(1.0, cur_speed / 100.0))
-                target_send_x = int(dead_x * speed_factor)
-                target_send_y = int(dead_y * speed_factor)
+                # 3. Dynamic Deadzone: Vertikal memiliki batas toleransi lebih lebar (kamera tenang di horizon)
+                dead_x = smooth_err_x if abs(smooth_err_x) > deadzone_x else 0.0
+                dead_y = smooth_err_y if abs(smooth_err_y) > deadzone_y else 0.0
+
+                # 4. Pengali Kecepatan Respon Independen (Pan vs Tilt)
+                speed_factor_x = max(0.15, min(1.0, cur_speed_pan / 100.0))
+                speed_factor_y = max(0.06, min(0.40, cur_speed_tilt / 100.0))
+
+                target_raw_x = int(dead_x * speed_factor_x)
+                target_raw_y = int(dead_y * speed_factor_y)
+
+                # 5. Slew-Rate Limiter (Batas Kecepatan Perubahan Sudut Maksimum Per Frame - Anti-Reog Mutlak!)
+                delta_x = target_raw_x - prev_send_x
+                clamped_dx = max(-max_step_pan, min(max_step_pan, delta_x))
+                actual_send_x = prev_send_x + clamped_dx
+                prev_send_x = actual_send_x
+
+                delta_y = target_raw_y - prev_send_y
+                clamped_dy = max(-max_step_tilt, min(max_step_tilt, delta_y))
+                actual_send_y = prev_send_y + clamped_dy
+                prev_send_y = actual_send_y
 
                 dist_cm = int(smooth_distance * 100)
-                send_err_x = -target_send_x if do_invert_pan else target_send_x
-                send_err_y = -target_send_y if do_invert_tilt else target_send_y
+                send_err_x = -actual_send_x if do_invert_pan else actual_send_x
+                send_err_y = -actual_send_y if do_invert_tilt else actual_send_y
                 serial_sender.send(f"X:{send_err_x},Y:{send_err_y},D:{dist_cm}\n")
             else:
                 smooth_err_x = 0.0
                 smooth_err_y = 0.0
+                prev_send_x = 0
+                prev_send_y = 0
                 with vision_state.lock:
                     vision_state.auto_tune_status = "MENUNGGU TARGET"
                     vision_state.auto_tune_metrics = servo_learner.metrics_str
