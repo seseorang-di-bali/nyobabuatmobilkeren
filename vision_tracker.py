@@ -200,6 +200,61 @@ def compare_clothes_color(frame, box, target_hist):
     except Exception:
         return 0.5
 
+def find_target_in_frame(frame, target_hist, box_w, box_h, face_cascade=None):
+    """
+    Sistem Persistent Re-Identification (Re-ID) & Auto-Snap:
+    Mencari kembali pemilik target di seluruh frame menggunakan signature warna baju yang tersimpan.
+    Jika target ditemukan dengan skor kecocokan tinggi (>= 48%), langsung mengembalikan kotak koordinatnya
+    sehingga sistem bisa langsung 'memaksa mengotaki' pemilik tanpa harus hitung mundur ulang.
+    """
+    if target_hist is None:
+        return None, 0.0
+
+    best_box = None
+    best_score = 0.0
+
+    # 1. Prioritas Pertama: Cek area tubuh di bawah wajah (jika wajah terdeteksi)
+    if face_cascade and not face_cascade.empty():
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(25, 25))
+            for (fx, fy, fw, fh) in faces:
+                fcx = fx + fw // 2
+                bx = max(0, min(FRAME_WIDTH - box_w, fcx - box_w // 2))
+                by = max(0, min(FRAME_HEIGHT - box_h, fy - 10))
+                cand_box = (bx, by, box_w, box_h)
+                score = compare_clothes_color(frame, cand_box, target_hist)
+                if score > best_score:
+                    best_score = score
+                    best_box = cand_box
+        except Exception:
+            pass
+
+    if best_score >= 0.50:
+        return best_box, best_score
+
+    # 2. Prioritas Kedua: Grid Scan cepat (untuk tampak belakang / orang membelakangi kamera)
+    y_center = max(0, min(FRAME_HEIGHT - box_h, (FRAME_HEIGHT - box_h) // 2))
+    y_candidates = [y_center]
+    if y_center - 25 >= 0:
+        y_candidates.append(y_center - 25)
+    if y_center + 25 <= FRAME_HEIGHT - box_h:
+        y_candidates.append(y_center + 25)
+
+    # Pindai secara horizontal dengan step 25 piksel
+    for x_cand in range(0, max(1, FRAME_WIDTH - box_w + 1), 25):
+        for y_cand in y_candidates:
+            cand_box = (x_cand, y_cand, box_w, box_h)
+            score = compare_clothes_color(frame, cand_box, target_hist)
+            if score > best_score:
+                best_score = score
+                best_box = cand_box
+
+    if best_score >= 0.48:
+        return best_box, best_score
+
+    return None, best_score
+
 def configure_camera_hardware(cap, cam_device):
     """
     Mengoptimalkan setting UVC camera (Logitech C170, dll) di Linux:
@@ -894,80 +949,96 @@ def main():
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Ganti mode ke '{current_mode.upper()}' dari Web HUD.")
 
-            # --- METODE 1: TRACKER DENGAN AUTO-LOCK (MOSSE ATAU KCF) ---
+            # --- METODE 1: TRACKER DENGAN AUTO-LOCK & PERSISTENT RE-ID ---
             if current_mode in ["kcf", "mosse"]:
                 now = time.time()
+                prof_info = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
+                box_w, box_h = prof_info["box"]
+
                 if not tracking_active:
-                    elapsed = now - lock_countdown_start
-                    remaining = countdown_duration - elapsed
-                    prof_info = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
-                    box_w, box_h = prof_info["box"]
-                    center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
-
-                    # Smart Auto-Snap: Deteksi posisi pengguna untuk memposisikan kotak badan
-                    if face_cascade and (now - last_face_scan > 0.15):
-                        last_face_scan = now
-                        gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=4, minSize=(30, 30))
-                        if len(faces_found) > 0:
-                            faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
-                            fx, fy, fw, fh = faces_found[0]
-                            fcx = fx + fw // 2
-                            top_y = max(0, fy - 14)
-                            left_x = max(0, min(FRAME_WIDTH - box_w, fcx - box_w // 2))
-                            if top_y + box_h > FRAME_HEIGHT:
-                                top_y = max(0, FRAME_HEIGHT - box_h)
-                            active_lock_box = (left_x, top_y, box_w, box_h)
+                    # KASUS A: SUDAH ADA MEMORI WARNA/BENTUK PEMILIK (Persistent Re-ID)
+                    # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame!
+                    if target_clothes_hist is not None:
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
+                        if re_box and re_score >= 0.48:
+                            tracker = create_tracker(current_mode)
+                            if tracker:
+                                tracker.init(frame, re_box)
+                                tracking_active = True
+                                target_box = re_box
+                                mismatch_streak = 0
+                                initial_th = re_box[3]
+                                smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
+                                status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
+                                status_color = (0, 255, 0)
+                                print(f"[RE-SNAP] Pemilik terdeteksi ({int(re_score * 100)}% match)! Memaksa mengotaki target...")
                         else:
-                            active_lock_box = center_box
+                            status_text = "SCANNING_OWNER"
+                            status_color = (0, 165, 255)
+                            cx_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
+                            cv2.rectangle(annotated_frame, (cx_box[0], cx_box[1]),
+                                          (cx_box[0] + cx_box[2], cx_box[1] + cx_box[3]), (0, 165, 255), 1)
+                            cv2.putText(annotated_frame, "MENCARI PEMILIK (MEMORI TERSIMPAN)...", (10, FRAME_HEIGHT - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
 
-                    if remaining > 0:
-                        status_text = f"LOCKING_IN_{remaining:.1f}S"
-                        status_color = (0, 255, 255)
-                        x, y, w, h = active_lock_box
-
-                        # Gambar Kotak Target Countdown
-                        cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-
-                        # Siluet panduan badan & pakaian di dalam kotak
-                        hcx = x + w // 2
-                        hcy = y + int(h * 0.22)
-                        hrx = max(10, int(w * 0.20))
-                        hry = max(12, int(h * 0.15))
-                        cv2.ellipse(annotated_frame, (hcx, hcy), (hrx, hry), 0, 0, 360, (0, 200, 240), 1)
-                        sh_y = y + int(h * 0.40)
-                        cv2.line(annotated_frame, (x + int(w * 0.12), sh_y), (x + int(w * 0.88), sh_y), (0, 200, 240), 1)
-                        cv2.line(annotated_frame, (x + int(w * 0.12), sh_y), (x + int(w * 0.20), y + int(h * 0.90)), (0, 180, 220), 1)
-                        cv2.line(annotated_frame, (x + int(w * 0.88), sh_y), (x + int(w * 0.80), y + int(h * 0.90)), (0, 180, 220), 1)
-
-                        cv2.putText(annotated_frame, f"KUNCI {prof_info['label']}: {remaining:.1f}s", (x, max(12, y - 8)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-                        cv2.putText(annotated_frame, "POSISIKAN BADAN & BAJU DI DALAM KOTAK", (10, FRAME_HEIGHT - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
+                    # KASUS B: BELUM ADA TEMPLATE DI MEMORI (Awal Start atau User Klik Reset)
                     else:
-                        tracker = create_tracker(current_mode)
-                        if tracker:
-                            tracker.init(frame, active_lock_box)
-                            target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
-                            tracking_active = True
-                            with vision_state.lock:
-                                vision_state.clothes_match_pct = 100
-                            initial_th = active_lock_box[3]
-                            smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
-                            print(f"[TRACKER] Target terkunci ({prof_info['name']}) via {current_mode.upper()}!")
+                        elapsed = now - lock_countdown_start
+                        remaining = countdown_duration - elapsed
+                        center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
+
+                        # Smart Auto-Snap jika ada wajah pengguna
+                        if face_cascade and (now - last_face_scan > 0.15):
+                            last_face_scan = now
+                            gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=4, minSize=(30, 30))
+                            if len(faces_found) > 0:
+                                faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
+                                fx, fy, fw, fh = faces_found[0]
+                                fcx = fx + fw // 2
+                                top_y = max(0, fy - 14)
+                                left_x = max(0, min(FRAME_WIDTH - box_w, fcx - box_w // 2))
+                                if top_y + box_h > FRAME_HEIGHT:
+                                    top_y = max(0, FRAME_HEIGHT - box_h)
+                                active_lock_box = (left_x, top_y, box_w, box_h)
+                            else:
+                                active_lock_box = center_box
+
+                        if remaining > 0:
+                            status_text = f"LOCKING_IN_{remaining:.1f}S"
+                            status_color = (0, 255, 255)
+                            x, y, w, h = active_lock_box
+
+                            # Gambar Kotak Target Countdown
+                            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                            cv2.putText(annotated_frame, f"REKAM TARGET {prof_info['label']}: {remaining:.1f}s", (x, max(12, y - 8)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+                            cv2.putText(annotated_frame, "POSISIKAN DIRI DI DALAM KOTAK UNTUK MEREKAM", (10, FRAME_HEIGHT - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
                         else:
-                            print(f"[ERROR] Gagal membuat tracker {current_mode}!")
+                            tracker = create_tracker(current_mode)
+                            if tracker:
+                                tracker.init(frame, active_lock_box)
+                                target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
+                                tracking_active = True
+                                with vision_state.lock:
+                                    vision_state.clothes_match_pct = 100
+                                initial_th = active_lock_box[3]
+                                smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
+                                print(f"[TRACKER] Target terkunci & disimpan di memori ({prof_info['name']}) via {current_mode.upper()}!")
+                            else:
+                                print(f"[ERROR] Gagal membuat tracker {current_mode}!")
+
                 else:
                     success, box = tracker.update(frame)
                     if success:
                         target_box = [int(v) for v in box]
-                        # Verifikasi kecocokan warna pakaian (baju / celana)
                         match_score = compare_clothes_color(frame, target_box, target_clothes_hist)
                         clothes_pct = int(match_score * 100)
                         with vision_state.lock:
                             vision_state.clothes_match_pct = clothes_pct
 
-                        if match_score >= 0.50:
+                        if match_score >= 0.48:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
@@ -976,29 +1047,43 @@ def main():
                             status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
                             status_color = (0, 165, 255)
 
-                            # FAILSAFE: Jika warna target tidak cocok selama >= 10 frame berturut-turut (~0.4 - 0.6s)
-                            # Berarti tracker menempel ke objek lain (misal monitor hitam, dinding, orang lain).
-                            # Segera tolak target dan lakukan Auto-Relock ke pengguna!
-                            if mismatch_streak >= 10:
-                                print(f"[TRACKER] Target mismatch ({clothes_pct}% match)! Menolak objek latar, memulai auto-relock...")
-                                tracking_active = False
-                                lock_countdown_start = time.time()
-                                countdown_duration = 1.5  # Countdown cepat untuk re-lock
-                                target_clothes_hist = None
-                                target_box = None
-                                mismatch_streak = 0
-                                status_text = "AUTO_RELOCKING"
-                                status_color = (0, 255, 255)
+                            # Jika menempel ke objek salah (seperti monitor/dinding selama >= 5 frame):
+                            # Langsung cari pemilik di seluruh frame dan paksa kotaki kembali!
+                            if mismatch_streak >= 5:
+                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
+                                if re_box and re_score >= 0.50:
+                                    print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
+                                    tracker = create_tracker(current_mode)
+                                    tracker.init(frame, re_box)
+                                    target_box = re_box
+                                    mismatch_streak = 0
+                                    status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
+                                    status_color = (0, 255, 0)
+                                else:
+                                    # Pemilik belum ketemu di frame saat ini
+                                    tracking_active = False
+                                    target_box = None
+                                    status_text = "SCANNING_OWNER"
+                                    status_color = (0, 165, 255)
                     else:
-                        status_text = "TARGET_LOST"
-                        status_color = (0, 0, 255)
-                        with vision_state.lock:
-                            vision_state.clothes_match_pct = 0
-                        tracking_active = False
-                        lock_countdown_start = time.time()
-                        countdown_duration = 2.0
-                        target_clothes_hist = None
-                        mismatch_streak = 0
+                        # Tracker lepas (misal gerakan cepat):
+                        # Pindai frame untuk mencari pemilik sesuai memori
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
+                        if re_box and re_score >= 0.50:
+                            print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
+                            tracker = create_tracker(current_mode)
+                            tracker.init(frame, re_box)
+                            tracking_active = True
+                            target_box = re_box
+                            mismatch_streak = 0
+                            status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
+                            status_color = (0, 255, 0)
+                        else:
+                            tracking_active = False
+                            target_box = None
+                            mismatch_streak = 0
+                            status_text = "SCANNING_OWNER"
+                            status_color = (0, 0, 255)
 
             # --- METODE 2: FACE DETECTOR (CASCADE) ---
             elif current_mode == "face":
