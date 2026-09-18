@@ -583,6 +583,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             for cnt in contours:
                 ca = cv2.contourArea(cnt)
                 if ca > 400:  # Blob pergerakan manusia
+                    cx, cy, cw, ch = cv2.boundingRect(cnt)
                     max_w = min(130, int(FRAME_WIDTH * 0.40))
                     max_h = min(165, int(FRAME_HEIGHT * 0.68))
                     cand_w = max(base_box_w, min(max_w, cw + 8))
@@ -1598,7 +1599,7 @@ def main():
     parser.add_argument("--invert-pan", action="store_true", help="Balik arah putaran servo Pan horizontal (jika mekanik terbalik)")
     parser.add_argument("--invert-tilt", action="store_true", help="Balik arah putaran servo Tilt vertikal")
     parser.add_argument("--flip-v", action="store_true", help="Aktifkan flip vertikal (jika kamera terbalik atas-bawah)")
-    parser.add_argument("--no-wdr", action="store_true", help="Nonaktifkan filter Anti-Silau (Wide Dynamic Range CLAHE)")
+    parser.add_argument("--wdr", action="store_true", help="Aktifkan filter Anti-Silau (Wide Dynamic Range CLAHE). Default OFF agar FPS tinggi.")
     args = parser.parse_args()
 
     vision_state.mirror = args.mirror and not args.no_mirror
@@ -1607,7 +1608,7 @@ def main():
     vision_state.invert_tilt = args.invert_tilt
     vision_state.target_profile = args.profile
     vision_state.mode = args.mode
-    vision_state.anti_silau = not args.no_wdr
+    vision_state.anti_silau = args.wdr
 
     # Cek ketersediaan GUI Display fisik (HDMI / X11)
     has_display = bool(os.environ.get("DISPLAY"))
@@ -1914,8 +1915,8 @@ def main():
                     else:
                         center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
 
-                        # Smart Human Detection: Scan setiap 0.06 detik (~16 fps) untuk mendeteksi manusia
-                        if now - last_face_scan > 0.06:
+                        # Smart Human Detection: Scan setiap ~0.22 detik (~4.5 Hz) untuk menghemat CPU STB
+                        if now - last_face_scan > 0.22:
                             last_face_scan = now
                             found_human = False
                             if yunet_detector:
@@ -2016,12 +2017,9 @@ def main():
                         if bw > 150 or bh > 185 or (bw * bh > FRAME_WIDTH * FRAME_HEIGHT * 0.35):
                             success = False
 
-                        # 1. AI Anchor & Dynamic Scale Correction (Setiap 4 frame):
-                        # Menggunakan YuNet Neural Net untuk menjaga kotak tetap melekat di tengah badan,
-                        # mencegah kotak bergeser ke bahu saat bergerak cepat / ngereog,
-                        # dan menyesuaikan ukuran kotak secara presisi saat pengguna menjauh (3-5m) atau mendekat.
+                        # 1. AI Anchor & Dynamic Scale Correction (Setiap 12 frame / ~0.4s untuk menghemat CPU):
                         ai_reanchored = False
-                        if yunet_detector and (frame_counter % 4 == 0):
+                        if yunet_detector and (frame_counter % 12 == 0):
                             ai_faces = run_yunet_detection(yunet_detector, frame)
                             for (fx, fy, fw, fh, conf) in ai_faces:
                                 ideal_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
@@ -2032,9 +2030,9 @@ def main():
                                 if abs(fcx - tcx) < max(bw, iw) * 0.85:
                                     drift_x = abs(tcx - (ix + iw // 2))
                                     scale_diff = abs(bw - iw) + abs(bh - ih)
-                                    if drift_x > 8 or scale_diff > 12:
-                                        new_w = max(30, min(FRAME_WIDTH, int(0.45 * bw + 0.55 * iw)))
-                                        new_h = max(40, min(FRAME_HEIGHT, int(0.45 * bh + 0.55 * ih)))
+                                    if drift_x > 10 or scale_diff > 14:
+                                        new_w = max(30, min(130, int(0.45 * bw + 0.55 * iw)))
+                                        new_h = max(40, min(165, int(0.45 * bh + 0.55 * ih)))
                                         new_x = max(0, min(FRAME_WIDTH - new_w, int(0.45 * bx + 0.55 * ix)))
                                         new_y = max(0, min(FRAME_HEIGHT - new_h, int(0.45 * by + 0.55 * iy)))
                                         target_box = [new_x, new_y, new_w, new_h]
@@ -2045,34 +2043,16 @@ def main():
                                     ai_reanchored = True
                                     break
 
-                        # 2. Anti-Bahu Drift via Color Histogram Symmetry:
-                        # Jika wajah tidak terlihat (misal tampak punggung), gunakan histogram warna
-                        # untuk memastikan kotak selalu berada di tengah baju, bukan di pinggir bahu
-                        if not ai_reanchored:
-                            raw_score = compare_clothes_color(frame, target_box, target_clothes_hist)
-                            offsets = [-12, -6, 6, 12]
-                            best_dx = 0
-                            best_s = raw_score
-                            for dx in offsets:
-                                tx = max(0, min(FRAME_WIDTH - bw, bx + dx))
-                                s = compare_clothes_color(frame, (tx, by, bw, bh), target_clothes_hist)
-                                if s > best_s:
-                                    best_s = s
-                                    best_dx = dx
-
-                            if best_dx != 0 and (best_s > raw_score + 0.03):
-                                new_x = max(0, min(FRAME_WIDTH - bw, bx + best_dx))
-                                target_box[0] = new_x
-                                bx = new_x
-                                match_score = best_s
-                                if abs(best_dx) >= 10:
-                                    tracker = create_tracker(current_mode)
-                                    if tracker:
-                                        tracker.init(frame, tuple(target_box))
-                            else:
-                                match_score = raw_score
-                        else:
+                        # 2. Verifikasi Warna Baju Ringan (Hanya setiap 4 frame, bukan tiap frame):
+                        if (frame_counter % 4 == 0) or ('match_score' not in locals()):
                             match_score = compare_clothes_color(frame, target_box, target_clothes_hist)
+                            clothes_pct = int(match_score * 100)
+                            with vision_state.lock:
+                                vision_state.clothes_match_pct = clothes_pct
+                        else:
+                            with vision_state.lock:
+                                clothes_pct = vision_state.clothes_match_pct
+                            match_score = clothes_pct / 100.0
 
                         clothes_pct = int(match_score * 100)
                         with vision_state.lock:
@@ -2260,35 +2240,11 @@ def main():
 
                 prof_data = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
 
-                # Hitung Jarak Monokular Aktual
+                # Hitung Jarak Monokular Aktual (0.00 ms, super ringan)
                 if current_mode == "face":
                     instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(8, th)
                 else:
-                    face_calibrated = False
-                    if yunet_detector and (frame_counter % 5 == 0):
-                        ai_faces = run_yunet_detection(yunet_detector, frame)
-                        for (fx, fy, fw, fh, conf) in ai_faces:
-                            if abs((fx + fw // 2) - cx) < tw * 0.85:
-                                instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(8, fh)
-                                face_calibrated = True
-                                break
-
-                    if not face_calibrated and not yunet_detector and face_cascade and (frame_counter % 8 == 0):
-                        roi_y1 = max(0, ty - int(th * 0.45))
-                        roi_y2 = min(FRAME_HEIGHT, ty + int(th * 0.35))
-                        roi_x1 = max(0, tx - 10)
-                        roi_x2 = min(FRAME_WIDTH, tx + tw + 10)
-                        if (roi_y2 - roi_y1 >= 25) and (roi_x2 - roi_x1 >= 25):
-                            roi_gray = cv2.cvtColor(frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY)
-                            sub_faces = face_cascade.detectMultiScale(roi_gray, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
-                            if len(sub_faces) > 0:
-                                sub_faces = sorted(sub_faces, key=lambda b: b[2] * b[3], reverse=True)
-                                _, _, _, sfh = sub_faces[0]
-                                instant_dist = (0.20 * FOCAL_LENGTH_PX) / max(8, sfh)
-                                face_calibrated = True
-
-                    if not face_calibrated:
-                        instant_dist = (prof_data["real_h"] * FOCAL_LENGTH_PX) / max(10, th)
+                    instant_dist = (prof_data["real_h"] * FOCAL_LENGTH_PX) / max(10, th)
 
                 instant_dist = max(0.4, min(6.0, instant_dist))
                 if smooth_distance <= 0.0:
@@ -2453,7 +2409,7 @@ def main():
                     last_idle_encode = now_time
 
             if should_encode:
-                ret_enc, jpeg = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                ret_enc, jpeg = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
                 if ret_enc:
                     with vision_state.lock:
                         vision_state.latest_jpeg = jpeg.tobytes()
@@ -2467,7 +2423,6 @@ def main():
                     else:
                         print(f"[{status_text:^20}] FPS: {fps:4.1f} | Mencari Target...         | Serial: {serial_state_str}")
                     last_terminal_print = now_time
-                time.sleep(0.005)
             else:
                 # Tampilkan di HDMI monitor jika terpasang layar
                 cv2.imshow("STB Vision Tracker", annotated_frame)
