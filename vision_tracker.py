@@ -536,8 +536,8 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                         best_score = eff_s
                         best_box = test_b
 
-            if best_score >= 0.25:
-                return best_box, max(0.40, best_score)
+            if best_score >= 0.50:
+                return best_box, best_score
 
     # 2. Prioritas Kedua: Haar Cascade Fallback
     if face_cascade and not face_cascade.empty():
@@ -557,8 +557,8 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                             best_score = eff_s
                             best_box = test_b
 
-                if best_score >= 0.28:
-                    return best_box, max(0.35, best_score)
+                if best_score >= 0.50:
+                    return best_box, best_score
         except Exception:
             pass
 
@@ -612,7 +612,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         except Exception:
             pass
 
-    if best_score >= 0.30:
+    if best_score >= 0.50:
         return best_box, best_score
 
     return None, best_score
@@ -1873,7 +1873,7 @@ def main():
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile,
                                                                frame_diff=frame_diff)
-                        if re_box and re_score >= 0.30:
+                        if re_box and re_score >= 0.50:
                             tracker = create_tracker(current_mode)
                             if tracker:
                                 tracker.init(frame, re_box)
@@ -2091,7 +2091,7 @@ def main():
                                                                         face_cascade=face_cascade,
                                                                         profile_type=current_profile,
                                                                         frame_diff=frame_diff)
-                            if cand_box and cand_score >= 0.30:
+                            if cand_box and cand_score >= 0.50:
                                 cand_mot = compute_box_motion(frame_diff, cand_box) if frame_diff is not None else 0.0
                                 if cand_mot > 1.8 or cand_score > match_score + 0.08:
                                     print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}), beralih ke majikan bergerak di {cand_box} ({int(cand_score*100)}%, mot={cand_mot:.1f})!")
@@ -2103,9 +2103,9 @@ def main():
                                         mismatch_streak = 0
                                         match_score = cand_score
                                         clothes_pct = int(match_score * 100)
-                            elif static_streak >= 25 and match_score < 0.38:
-                                # Sudah diam >= 25 frame dan skor baju rendah -> lepas kuncian benda mati
-                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}, match={clothes_pct}%). Melepas kuncian!")
+                            elif static_streak >= 25 and match_score < 0.50:
+                                # Sudah diam >= 25 frame dan skor baju rendah (<50%) -> lepas kuncian benda mati
+                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}, match={clothes_pct}% < 50%). Melepas kuncian!")
                                 tracking_active = False
                                 target_box = None
                                 static_streak = 0
@@ -2114,7 +2114,7 @@ def main():
                                 status_color = (0, 165, 255)
 
                         if target_box is not None:
-                            is_valid_match = (match_score >= 0.32) or (ai_reanchored and match_score >= 0.20)
+                            is_valid_match = (match_score >= 0.50) or (ai_reanchored and match_score >= 0.40)
                             if is_valid_match:
                                 mismatch_streak = 0
                                 status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
@@ -2136,7 +2136,7 @@ def main():
                                                                            profile_type=current_profile,
                                                                            last_target_box=target_box,
                                                                            frame_diff=frame_diff)
-                                    if re_box and re_score >= 0.30:
+                                    if re_box and re_score >= 0.50:
                                         print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                         tracker = create_tracker(current_mode)
                                         tracker.init(frame, re_box)
@@ -2160,7 +2160,7 @@ def main():
                                                                profile_type=current_profile,
                                                                last_target_box=target_box,
                                                                frame_diff=frame_diff)
-                        if re_box and re_score >= 0.30:
+                        if re_box and re_score >= 0.50:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
