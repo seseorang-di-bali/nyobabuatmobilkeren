@@ -534,22 +534,31 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         except Exception:
             pass
 
-    # 3. Prioritas Ketiga: Full-Frame Multi-Scale Grid Scan (Mencakup seluruh area vertikal frame untuk tampak punggung)
-    scales = [0.55, 0.75, 1.0, 1.25]
-    for s in scales:
-        cw = max(32, min(FRAME_WIDTH - 10, int(base_box_w * s)))
-        ch = max(42, min(FRAME_HEIGHT - 10, int(base_box_h * s)))
-        step_x = max(16, int(cw * 0.22))
-        step_y = max(20, int(ch * 0.25))
+    # 3. Prioritas Ketiga: Ultra-Fast Color Back-Projection (~1-2 ms, OpenCV Native C++)
+    # Menggantikan 440 sliding-window loop yang sebelumnya menghabiskan 1000ms dan menyebabkan 1 FPS.
+    if target_hist and isinstance(target_hist, dict) and target_hist.get("u_hs") is not None:
+        try:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            prob_map = cv2.calcBackProject([hsv], [0, 1], target_hist["u_hs"], [0, 180, 0, 256], 255.0)
+            ksize = 21
+            prob_blur = cv2.boxFilter(prob_map, -1, (ksize, ksize))
+            _, max_val, _, max_loc = cv2.minMaxLoc(prob_blur)
 
-        for x_cand in range(0, max(1, FRAME_WIDTH - cw + 1), step_x):
-            for y_cand in range(10, max(11, FRAME_HEIGHT - ch + 1), step_y):
-                cand_box = (x_cand, y_cand, cw, ch)
-                score = compare_clothes_color(frame, cand_box, target_hist)
-                eff_s = calculate_effective_score(cand_box, score)
-                if eff_s > best_score:
-                    best_score = eff_s
-                    best_box = cand_box
+            if max_val > 15:  # Klaster warna pakaian ditemukan
+                cx, cy = max_loc
+                for s in [0.85, 1.0, 1.15]:
+                    cw = max(32, min(FRAME_WIDTH - 10, int(base_box_w * s)))
+                    ch = max(42, min(FRAME_HEIGHT - 10, int(base_box_h * s)))
+                    bx = max(0, min(FRAME_WIDTH - cw, cx - cw // 2))
+                    by = max(0, min(FRAME_HEIGHT - ch, cy - int(ch * 0.35)))
+                    cand_box = (bx, by, cw, ch)
+                    score = compare_clothes_color(frame, cand_box, target_hist)
+                    eff_s = calculate_effective_score(cand_box, score)
+                    if eff_s > best_score:
+                        best_score = eff_s
+                        best_box = cand_box
+        except Exception:
+            pass
 
     if best_score >= 0.52:
         return best_box, best_score
@@ -619,6 +628,60 @@ def create_tracker(tracker_type):
     return None
 
 
+class ThreadedCamera:
+    """
+    Dedicated background thread to continuously capture frames from USB webcam.
+    Ensures zero buffer lag: cap.read() always returns the latest live frame,
+    dropping stale buffered frames in the background.
+    """
+    def __init__(self, src=0, width=320, height=240, fps=30):
+        backend = cv2.CAP_V4L2 if sys.platform.startswith('linux') else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(src, backend)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.ret = False
+        self.frame = None
+        if self.cap.isOpened():
+            self.ret, self.frame = self.cap.read()
+
+        self.running = True
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def _capture_loop(self):
+        while self.running:
+            if not self.cap.isOpened():
+                time.sleep(0.05)
+                continue
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame
+            else:
+                time.sleep(0.01)
+
+    def read(self):
+        with self.lock:
+            if self.frame is None:
+                return False, None
+            return self.ret, self.frame.copy()
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=0.3)
+        self.cap.release()
+
+
 class VisionState:
     """State thread-safe untuk berbagi data antara visual tracker dan Web HUD."""
     def __init__(self):
@@ -635,8 +698,10 @@ class VisionState:
         self.active_clients = 0
         self.trigger_reset = False
         self.change_mode_req = None
-        self.mirror = True       # Default mirror horizontal ON
+        self.mirror = False      # Default mirror OFF (orientasi nyata dunia robot)
         self.flip_v = False      # Flip vertikal (jika kamera terbalik atas-bawah)
+        self.invert_pan = False  # Invert arah putaran servo Pan horizontal
+        self.invert_tilt = False # Invert arah putaran servo Tilt vertikal
         self.target_profile = "torso"  # Default: Badan Atas & Baju
         self.change_profile_req = None
         self.distance_m = 0.0
@@ -791,8 +856,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 <button id="btn-mode-mosse" class="btn-secondary" onclick="switchMode('mosse')">Mode MOSSE (Fast)</button>
                 <button id="btn-mode-face" class="btn-secondary" onclick="switchMode('face')">Mode Wajah</button>
                 <button id="btn-toggle-wdr" class="btn-primary" onclick="toggleAntiSilau()">☀️ Anti-Silau (WDR ON)</button>
-                <button id="btn-toggle-mirror" class="btn-primary" onclick="toggleMirror()">🪞 Mirror (Kiri/Kanan)</button>
+                <button id="btn-toggle-mirror" class="btn-secondary" onclick="toggleMirror()">🪞 Mirror (Kiri/Kanan)</button>
                 <button id="btn-toggle-flip-v" class="btn-secondary" onclick="toggleFlipV()">↕️ Flip Vertikal</button>
+                <button id="btn-toggle-invert-pan" class="btn-secondary" onclick="toggleInvertPan()">🔁 Invert Pan (Kiri/Kanan)</button>
             </div>
         </div>
 
@@ -836,6 +902,12 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch('/api/toggle_anti_silau', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => console.log('Anti-Silau toggled to: ' + data.anti_silau));
+        }
+
+        function toggleInvertPan() {
+            fetch('/api/toggle_invert_pan', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => console.log('Invert Pan toggled to: ' + data.invert_pan));
         }
 
         function updateTelemetry() {
@@ -935,7 +1007,7 @@ HTML_PAGE = """<!DOCTYPE html>
                         }
                     });
 
-                    // Highlight tombol toggle mirror & flip-v & anti-silau
+                    // Highlight tombol toggle mirror & flip-v & anti-silau & invert-pan
                     const btnMirror = document.getElementById('btn-toggle-mirror');
                     if (btnMirror) {
                         btnMirror.className = data.mirror ? 'btn-primary' : 'btn-secondary';
@@ -943,6 +1015,11 @@ HTML_PAGE = """<!DOCTYPE html>
                     const btnFlipV = document.getElementById('btn-toggle-flip-v');
                     if (btnFlipV) {
                         btnFlipV.className = data.flip_v ? 'btn-primary' : 'btn-secondary';
+                    }
+                    const btnInvertPan = document.getElementById('btn-toggle-invert-pan');
+                    if (btnInvertPan) {
+                        btnInvertPan.className = data.invert_pan ? 'btn-primary' : 'btn-secondary';
+                        btnInvertPan.innerText = data.invert_pan ? '🔁 Invert Pan (ON)' : '🔁 Invert Pan (OFF)';
                     }
                     const btnWdr = document.getElementById('btn-toggle-wdr');
                     if (btnWdr) {
@@ -1030,6 +1107,7 @@ def create_app():
                 "serial_port": str(vision_state.serial_port),
                 "mirror": bool(vision_state.mirror),
                 "flip_v": bool(vision_state.flip_v),
+                "invert_pan": bool(vision_state.invert_pan),
                 "anti_silau": bool(vision_state.anti_silau),
                 "clothes_match_pct": int(vision_state.clothes_match_pct)
             })
@@ -1065,6 +1143,13 @@ def create_app():
             vision_state.trigger_reset = True
             new_val = vision_state.flip_v
         return jsonify({"status": "ok", "flip_v": new_val})
+
+    @app.route('/api/toggle_invert_pan', methods=['POST', 'GET'])
+    def api_toggle_invert_pan():
+        with vision_state.lock:
+            vision_state.invert_pan = not vision_state.invert_pan
+            new_val = vision_state.invert_pan
+        return jsonify({"status": "ok", "invert_pan": new_val})
 
     @app.route('/api/toggle_anti_silau', methods=['POST', 'GET'])
     def api_toggle_anti_silau():
@@ -1107,13 +1192,18 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Simulasi tanpa mengirim serial ke ESP32")
     parser.add_argument("--no-web", action="store_true", help="Nonaktifkan streaming Web HUD")
     parser.add_argument("--web-port", type=int, default=8080, help="Port Web HUD streaming (default: 8080)")
-    parser.add_argument("--no-mirror", action="store_true", help="Nonaktifkan mirror horizontal (kamera selfie)")
+    parser.add_argument("--mirror", action="store_true", help="Aktifkan mirror horizontal (kamera selfie). Default OFF untuk robot.")
+    parser.add_argument("--no-mirror", action="store_true", help="Nonaktifkan mirror horizontal (legacy flag)")
+    parser.add_argument("--invert-pan", action="store_true", help="Balik arah putaran servo Pan horizontal (jika mekanik terbalik)")
+    parser.add_argument("--invert-tilt", action="store_true", help="Balik arah putaran servo Tilt vertikal")
     parser.add_argument("--flip-v", action="store_true", help="Aktifkan flip vertikal (jika kamera terbalik atas-bawah)")
     parser.add_argument("--no-wdr", action="store_true", help="Nonaktifkan filter Anti-Silau (Wide Dynamic Range CLAHE)")
     args = parser.parse_args()
 
-    vision_state.mirror = not args.no_mirror
+    vision_state.mirror = args.mirror and not args.no_mirror
     vision_state.flip_v = args.flip_v
+    vision_state.invert_pan = args.invert_pan
+    vision_state.invert_tilt = args.invert_tilt
     vision_state.target_profile = args.profile
     vision_state.mode = args.mode
     vision_state.anti_silau = not args.no_wdr
@@ -1139,7 +1229,8 @@ def main():
     print(f" - Kamera   : Index {cam_index} ({cam_device})")
     print(f" - Jarak    : Monocular Vision Estimator Aktif")
     print(f" - Anti-Silau: {'ON (WDR CLAHE)' if vision_state.anti_silau else 'OFF'}")
-    print(f" - Mirror   : {'ON (Horizontal)' if vision_state.mirror else 'OFF'}{' + [FLIP-V]' if vision_state.flip_v else ''}")
+    print(f" - InvertPan : {'ON (Dibalik)' if vision_state.invert_pan else 'OFF (Normal)'}")
+    print(f" - Mirror   : {'ON (Horizontal)' if vision_state.mirror else 'OFF (Robot View)'}{' + [FLIP-V]' if vision_state.flip_v else ''}")
     print(f" - UI Mode  : {'HEADLESS (SSH Terminal)' if is_headless else 'DESKTOP GUI (HDMI)'}")
     if not args.no_web:
         print(f" - Web HUD  : \033[1;32m{web_url}\033[0m  <-- Buka di browser Mac!")
@@ -1161,12 +1252,8 @@ def main():
     vision_state.serial_port = args.port or ("AUTO" if not args.dry_run else "DRY_RUN")
     vision_state.mode = args.mode
 
-    # Inisialisasi Kamera UVC
-    cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2 if sys.platform.startswith('linux') else cv2.CAP_ANY)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # Inisialisasi Kamera UVC dengan Background Threading (Zero-Latency Buffer)
+    cap = ThreadedCamera(cam_index, width=FRAME_WIDTH, height=FRAME_HEIGHT, fps=30)
 
     if not cap.isOpened():
         print(f"[ERROR] Tidak dapat membuka kamera pada index {cam_index} ({cam_device})!")
@@ -1178,7 +1265,7 @@ def main():
         return
 
     # Optimasi Hardware UVC Camera (Backlight Compensation, Anti-Silau & Anti-Flicker)
-    configure_camera_hardware(cap, cam_device)
+    configure_camera_hardware(cap.cap, cam_device)
 
     # Inisialisasi Detektor Wajah (YuNet Neural Network + Haar Cascade Fallback)
     face_cascade = get_cascade_classifier()
@@ -1214,9 +1301,8 @@ def main():
     try:
         while True:
             ret, frame = cap.read()
-            if not ret:
-                print("[WARN] Gagal membaca frame dari webcam.")
-                time.sleep(0.05)
+            if not ret or frame is None:
+                time.sleep(0.01)
                 continue
 
             frame_counter += 1
@@ -1226,6 +1312,8 @@ def main():
                 do_mirror = vision_state.mirror
                 do_flip_v = vision_state.flip_v
                 do_anti_silau = vision_state.anti_silau
+                do_invert_pan = vision_state.invert_pan
+                do_invert_tilt = vision_state.invert_tilt
 
             # Mirror horizontal (kamera selfie / pembalik gambar) & Flip vertikal
             if do_mirror and do_flip_v:
@@ -1703,7 +1791,9 @@ def main():
             now_time = time.time()
             if has_target:
                 dist_cm = int(smooth_distance * 100)
-                serial_sender.send(f"X:{err_x},Y:{err_y},D:{dist_cm}\n")
+                send_err_x = -err_x if do_invert_pan else err_x
+                send_err_y = -err_y if do_invert_tilt else err_y
+                serial_sender.send(f"X:{send_err_x},Y:{send_err_y},D:{dist_cm}\n")
             else:
                 serial_sender.send("LOST\n")
             serial_state_str = serial_sender.state_str
@@ -1716,6 +1806,8 @@ def main():
             mirror_tag = " [MIRROR]" if do_mirror else ""
             if do_flip_v:
                 mirror_tag += " [FLIP-V]"
+            if do_invert_pan:
+                mirror_tag += " [INV-PAN]"
             cv2.putText(annotated_frame, f"FPS: {fps:.1f} | {current_mode.upper()}{mirror_tag}", (10, 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             cv2.putText(annotated_frame, f"Status: {status_text}", (10, 34),

@@ -50,6 +50,10 @@ const float KP_PAN      = 0.04;  // Kecepatan respon belok Pan
 const float KP_TILT     = 0.03;  // Kecepatan respon Tilt
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
+// Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)
+const bool INVERT_PAN   = false; // Set true jika servo belok berlawanan arah target
+const bool INVERT_TILT  = false; // Set true jika servo mendongak/menunduk terbalik
+
 // ================= OBJEK PERANGKAT =================
 Servo servoPan;
 Servo servoTilt;
@@ -147,17 +151,19 @@ void processPacket(char* pkt) {
       lastPacketTime = millis();
 
       // 2. KENDALI PROPORSIONAL SERVO PAN-TILT
-      // Pan: Jika target di kanan (ErrX > 0), putar servo ke kanan
+      // Pan: Belokkan servo menuju posisi target horizontal
       if (abs(targetErrX) > DEADZONE_PX) {
-        float deltaPan = - (targetErrX * KP_PAN);
+        float dirPan = INVERT_PAN ? 1.0 : -1.0;
+        float deltaPan = dirPan * (targetErrX * KP_PAN);
         currentPan += deltaPan;
         currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
         servoPan.write((int)currentPan);
       }
 
-      // Tilt: Jika target di bawah (ErrY > 0), tundukkan kamera
+      // Tilt: Arahkan kamera vertikal (nunduk/mendongak)
       if (abs(targetErrY) > DEADZONE_PX) {
-        float deltaTilt = (targetErrY * KP_TILT);
+        float dirTilt = INVERT_TILT ? -1.0 : 1.0;
+        float deltaTilt = dirTilt * (targetErrY * KP_TILT);
         currentTilt += deltaTilt;
         currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
         servoTilt.write((int)currentTilt);
