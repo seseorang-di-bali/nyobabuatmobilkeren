@@ -414,12 +414,12 @@ def compare_clothes_color(frame, box, target_sig):
             # Jika gambar minim saturasi warna (achromatic / abu-abu di ruangan redup):
             if avg_sat < 28.0:
                 base_s = 0.40 * s_hs + 0.60 * s_v
-                # Bandingkan tekstur/kerutan kain vs kasur/dinding
+                # Bandingkan tekstur kain dengan penalti lembut (jangan memotong skor drastis saat jarak berubah)
                 if t_std is not None and c_std is not None:
                     diff_std = abs(t_std - c_std)
-                    tex_factor = max(0.35, 1.0 - (diff_std / 30.0))
+                    tex_factor = max(0.75, 1.0 - (diff_std / 80.0))
                     return base_s * tex_factor
-                return base_s * 0.70
+                return base_s * 0.85
             else:
                 return 0.75 * s_hs + 0.25 * s_v
 
@@ -490,7 +490,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         cx = cand_b[0] + cand_b[2] // 2
         cy = cand_b[1] + cand_b[3] // 2
         dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
-        prox_factor = max(0.70, 1.0 - (dist / 380.0))
+        prox_factor = max(0.85, 1.0 - (dist / 600.0))
         return raw_s * prox_factor
 
     # 1. Prioritas Utama: YuNet AI Neural Network Detector (~5-9 ms)
@@ -508,8 +508,8 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                         best_score = eff_s
                         best_box = test_b
 
-            if best_score >= 0.36:
-                return best_box, max(0.55, best_score)
+            if best_score >= 0.25:
+                return best_box, max(0.40, best_score)
 
     # 2. Prioritas Kedua: Haar Cascade Fallback
     if face_cascade and not face_cascade.empty():
@@ -529,8 +529,8 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                             best_score = eff_s
                             best_box = test_b
 
-                if best_score >= 0.42:
-                    return best_box, best_score
+                if best_score >= 0.28:
+                    return best_box, max(0.35, best_score)
         except Exception:
             pass
 
@@ -544,7 +544,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             prob_blur = cv2.boxFilter(prob_map, -1, (ksize, ksize))
             _, max_val, _, max_loc = cv2.minMaxLoc(prob_blur)
 
-            if max_val > 15:  # Klaster warna pakaian ditemukan
+            if max_val > 10:  # Klaster warna pakaian ditemukan
                 cx, cy = max_loc
                 for s in [0.85, 1.0, 1.15]:
                     cw = max(32, min(FRAME_WIDTH - 10, int(base_box_w * s)))
@@ -560,7 +560,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         except Exception:
             pass
 
-    if best_score >= 0.52:
+    if best_score >= 0.32:
         return best_box, best_score
 
     return None, best_score
@@ -1436,13 +1436,14 @@ def main():
     target_clothes_hist = None
     tracking_active = False
     countdown_start = None
-    countdown_duration = 2.0
+    countdown_duration = 1.0
     human_last_seen = 0.0
     smooth_distance = 0.0
     dist_status = "SEARCHING"
     last_face_scan = 0
     frame_counter = 0
     mismatch_streak = 0
+    scanning_owner_start = None
     smooth_err_x = 0.0
     smooth_err_y = 0.0
     servo_tuner = AdaptiveServoTuner()
@@ -1496,8 +1497,9 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 2.0
+                    countdown_duration = 1.0
                     countdown_start = None
+                    scanning_owner_start = None
                     active_lock_box = None
                     human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
@@ -1515,8 +1517,9 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 2.0
+                    countdown_duration = 1.0
                     countdown_start = None
+                    scanning_owner_start = None
                     human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
                     print(f"[CONTROL] Profil target diubah ke '{prof_info['name']}'.")
@@ -1528,8 +1531,9 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 2.0
+                    countdown_duration = 1.0
                     countdown_start = None
+                    scanning_owner_start = None
                     active_lock_box = None
                     human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
@@ -1585,6 +1589,9 @@ def main():
                     tracking_active = True
                     target_box = list(clicked_box)
                     mismatch_streak = 0
+                    scanning_owner_start = None
+                    countdown_start = None
+                    active_lock_box = None
                     with vision_state.lock:
                         vision_state.clothes_match_pct = 100
                     smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, clicked_box[3])
@@ -1602,30 +1609,47 @@ def main():
                     # KASUS A: SUDAH ADA MEMORI WARNA/BENTUK PEMILIK (Persistent Re-ID)
                     # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame secara multi-skala!
                     if target_clothes_hist is not None:
+                        if scanning_owner_start is None:
+                            scanning_owner_start = now
+
                         re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile)
-                        if re_box and re_score >= 0.52:
+                        if re_box and re_score >= 0.32:
                             tracker = create_tracker(current_mode)
                             if tracker:
                                 tracker.init(frame, re_box)
                                 tracking_active = True
                                 target_box = list(re_box)
                                 mismatch_streak = 0
+                                scanning_owner_start = None
                                 initial_th = re_box[3]
                                 smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
                                 status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                                 status_color = (0, 255, 0)
                                 print(f"[RE-SNAP] Pemilik terdeteksi ({int(re_score * 100)}% match)! Memaksa mengotaki target...")
                         else:
-                            status_text = "SCANNING_OWNER"
-                            status_color = (0, 165, 255)
-                            cx_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
-                            cv2.rectangle(annotated_frame, (cx_box[0], cx_box[1]),
-                                          (cx_box[0] + cx_box[2], cx_box[1] + cx_box[3]), (0, 165, 255), 1)
-                            cv2.putText(annotated_frame, "MENCARI PEMILIK (MEMORI TERSIMPAN)...", (10, FRAME_HEIGHT - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
+                            # Failsafe: Jika scanning memori lama melebihi 2.0 detik tanpa hasil:
+                            # Reset memori agar tidak terjebak selamanya, dan siap mengunci ulang siapapun majikan di depan kamera!
+                            if (now - scanning_owner_start) > 2.0:
+                                print("[AUTO-RECOVER] Timeout 2.0s memori lama tidak ditemukan! Reset ke mode auto-lock majikan baru...")
+                                target_clothes_hist = None
+                                scanning_owner_start = None
+                                countdown_start = None
+                                active_lock_box = None
+                                human_last_seen = 0.0
+                                status_text = "AUTO_RECOVER"
+                                status_color = (0, 200, 255)
+                            else:
+                                status_text = "SCANNING_OWNER"
+                                status_color = (0, 165, 255)
+                                cx_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
+                                cv2.rectangle(annotated_frame, (cx_box[0], cx_box[1]),
+                                              (cx_box[0] + cx_box[2], cx_box[1] + cx_box[3]), (0, 165, 255), 1)
+                                time_left = max(0.0, 2.0 - (now - scanning_owner_start))
+                                cv2.putText(annotated_frame, f"MENCARI PEMILIK ({time_left:.1f}s)...", (10, FRAME_HEIGHT - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
 
                     # KASUS B: BELUM ADA TEMPLATE DI MEMORI (Awal Start atau User Klik Reset)
                     else:
@@ -1656,6 +1680,23 @@ def main():
                                 except Exception:
                                     pass
 
+                            # Fallback Jarak Dekat (Close-up Torso):
+                            # Jika kepala terpotong di atas frame, periksa apakah kotak tengah diisi oleh tubuh manusia
+                            if not found_human:
+                                try:
+                                    cx, cy, cw, ch = center_box
+                                    c_roi = frame[cy:cy+ch, cx:cx+cw]
+                                    if c_roi.size > 0:
+                                        c_gray = cv2.cvtColor(c_roi, cv2.COLOR_BGR2GRAY)
+                                        c_std = float(np.std(c_gray))
+                                        # Pakaian dan badan manusia memiliki variansi tekstur yang nyata (> 18.0)
+                                        if c_std > 18.0:
+                                            active_lock_box = center_box
+                                            human_last_seen = now
+                                            found_human = True
+                                except Exception:
+                                    pass
+
                         # Manusia dianggap aktif jika terdeteksi dalam 0.6 detik terakhir (toleransi flicker scan)
                         human_present = (now - human_last_seen < 0.6) and (active_lock_box is not None)
 
@@ -1673,7 +1714,7 @@ def main():
                             cv2.putText(annotated_frame, "STANDBY: MENUNGGU MAJIKAN...", (cx, max(14, cy - 8)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
                         else:
-                            # ADA MANUSIA TERDETEKSI: Jalankan hitung mundur 2 detik untuk merekam target
+                            # ADA MANUSIA TERDETEKSI: Jalankan hitung mundur 1 detik untuk merekam target
                             if countdown_start is None:
                                 countdown_start = now
 
@@ -1700,6 +1741,7 @@ def main():
                                     target_box = list(active_lock_box)
                                     mismatch_streak = 0
                                     countdown_start = None
+                                    scanning_owner_start = None
                                     with vision_state.lock:
                                         vision_state.clothes_match_pct = 100
                                     initial_th = active_lock_box[3]
@@ -1786,25 +1828,28 @@ def main():
                             if curr_hist is not None and target_clothes_hist is not None:
                                 target_clothes_hist = update_clothes_color_signature(target_clothes_hist, curr_hist, alpha=0.96)
 
-                        is_valid_match = (match_score >= 0.45) or (ai_reanchored and match_score >= 0.30)
+                        is_valid_match = (match_score >= 0.32) or (ai_reanchored and match_score >= 0.20)
                         if is_valid_match:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
                         else:
                             mismatch_streak += 1
-                            status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
-                            status_color = (0, 165, 255)
+                            if mismatch_streak < 20:
+                                # Masih dalam batas toleransi sesaat (bayangan, putaran badan, lengan lewat)
+                                status_text = f"TRACKING_SOFT ({clothes_pct}%)"
+                                status_color = (0, 200, 255)
+                            else:
+                                status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
+                                status_color = (0, 165, 255)
 
-                            # Jika menempel ke objek salah (seperti pintu/tembok selama >= 3 frame):
-                            # Langsung cari pemilik di seluruh frame secara multi-skala dan paksa kotaki kembali!
-                            if mismatch_streak >= 3:
+                                # Jika benar-benar mismatch >= 20 frame berturut-turut (~0.7s):
                                 re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                        yunet_detector=yunet_detector,
                                                                        face_cascade=face_cascade,
                                                                        profile_type=current_profile,
                                                                        last_target_box=target_box)
-                                if re_box and re_score >= 0.52:
+                                if re_box and re_score >= 0.32:
                                     print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                     tracker = create_tracker(current_mode)
                                     tracker.init(frame, re_box)
@@ -1815,28 +1860,32 @@ def main():
                                 else:
                                     tracking_active = False
                                     target_box = None
+                                    scanning_owner_start = now
                                     status_text = "SCANNING_OWNER"
                                     status_color = (0, 165, 255)
                     else:
-                        # Tracker lepas (misal gerakan cepat / ngereog):
+                        # Tracker lepas (misal gerakan sangat cepat / ngereog):
                         re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile,
                                                                last_target_box=target_box)
-                        if re_box and re_score >= 0.52:
+                        if re_box and re_score >= 0.32:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
                             tracking_active = True
                             target_box = list(re_box)
                             mismatch_streak = 0
+                            scanning_owner_start = None
                             status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                             status_color = (0, 255, 0)
                         else:
                             tracking_active = False
                             target_box = None
                             mismatch_streak = 0
+                            if scanning_owner_start is None:
+                                scanning_owner_start = now
                             status_text = "SCANNING_OWNER"
                             status_color = (0, 0, 255)
 
@@ -1866,7 +1915,7 @@ def main():
             # Hitung Deviasi Piksel & Estimasi Jarak Monokular
             err_x = 0
             err_y = 0
-            has_target = (target_box is not None) and (mismatch_streak < 2)
+            has_target = (target_box is not None) and (mismatch_streak < 20)
 
             if has_target:
                 tx, ty, tw, th = target_box
