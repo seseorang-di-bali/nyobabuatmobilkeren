@@ -433,7 +433,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                     best_score = eff_s
                     best_box = cand_box
 
-    if best_score >= 0.42:
+    if best_score >= 0.52:
         return best_box, best_score
 
     return None, best_score
@@ -1241,7 +1241,7 @@ def main():
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile)
-                        if re_box and re_score >= 0.42:
+                        if re_box and re_score >= 0.52:
                             tracker = create_tracker(current_mode)
                             if tracker:
                                 tracker.init(frame, re_box)
@@ -1264,16 +1264,12 @@ def main():
 
                     # KASUS B: BELUM ADA TEMPLATE DI MEMORI (Awal Start atau User Klik Reset)
                     else:
-                        elapsed = now - lock_countdown_start
-                        remaining = countdown_duration - elapsed
                         center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
 
-                        # Smart AI Auto-Snap:
-                        # 1. Coba YuNet AI terlebih dahulu (mendeteksi orang di 3-5 meter sekalipun ada bayangan lampu plafon)
-                        # 2. Coba Haar cascade sebagai fallback
+                        # Smart Human Detection: Cek keberadaan manusia sebelum memulai hitung mundur
+                        ai_detected = False
                         if now - last_face_scan > 0.08:
                             last_face_scan = now
-                            ai_detected = False
                             if yunet_detector:
                                 ai_faces = run_yunet_detection(yunet_detector, frame)
                                 if len(ai_faces) > 0:
@@ -1293,35 +1289,50 @@ def main():
                                 except Exception:
                                     pass
 
-                            if not ai_detected and remaining <= 0:
-                                active_lock_box = center_box
+                        if not ai_detected:
+                            # TIDAK ADA MANUSIA: Jangan pernah hitung mundur dan jangan mengunci pintu/tembok kosong!
+                            lock_countdown_start = now  # Reset timer terus-menerus
+                            status_text = "MENUNGGU_MAJIKAN"
+                            status_color = (0, 200, 255)
+                            cx, cy, cw, ch = center_box
 
-                        if remaining > 0:
-                            status_text = f"LOCKING_IN_{remaining:.1f}S"
-                            status_color = (0, 255, 255)
+                            # Gambar kotak panduan standby di tengah
+                            cv2.rectangle(annotated_frame, (cx, cy), (cx + cw, cy + ch), (0, 200, 255), 1)
+                            cv2.putText(annotated_frame, "BERDIRI DI DEPAN KAMERA ATAU KLIK VIDEO", (10, FRAME_HEIGHT - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
+                            cv2.putText(annotated_frame, "STANDBY: MENUNGGU MAJIKAN...", (cx, max(14, cy - 8)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
+                        else:
+                            # ADA MANUSIA TERDETEKSI: Jalankan hitung mundur 3 detik untuk merekam target
+                            elapsed = now - lock_countdown_start
+                            remaining = countdown_duration - elapsed
                             x, y, w, h = active_lock_box
 
-                            # Gambar Kotak Target Countdown
-                            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                            cv2.putText(annotated_frame, f"REKAM TARGET {prof_info['label']}: {remaining:.1f}s", (x, max(12, y - 8)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-                            cv2.putText(annotated_frame, "POSISIKAN DIRI ATAU KLIK VIDEO UNTUK MENGUNCI", (10, FRAME_HEIGHT - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
-                        else:
-                            tracker = create_tracker(current_mode)
-                            if tracker:
-                                tracker.init(frame, active_lock_box)
-                                target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
-                                tracking_active = True
-                                target_box = list(active_lock_box)
-                                mismatch_streak = 0
-                                with vision_state.lock:
-                                    vision_state.clothes_match_pct = 100
-                                initial_th = active_lock_box[3]
-                                smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
-                                print(f"[TRACKER] Target terkunci & disimpan di memori ({prof_info['name']}) via {current_mode.upper()}!")
+                            if remaining > 0:
+                                status_text = f"LOCKING_IN_{remaining:.1f}S"
+                                status_color = (0, 255, 255)
+
+                                # Gambar Kotak Target Countdown yang menempel di manusia
+                                cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                                cv2.putText(annotated_frame, f"REKAM TARGET {prof_info['label']}: {remaining:.1f}s", (x, max(12, y - 8)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+                                cv2.putText(annotated_frame, "MANUSIA TERDETEKSI! DIAM SEBENTAR UNTUK MEREKAM", (10, FRAME_HEIGHT - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 255), 1)
                             else:
-                                print(f"[ERROR] Gagal membuat tracker {current_mode}!")
+                                tracker = create_tracker(current_mode)
+                                if tracker:
+                                    tracker.init(frame, active_lock_box)
+                                    target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
+                                    tracking_active = True
+                                    target_box = list(active_lock_box)
+                                    mismatch_streak = 0
+                                    with vision_state.lock:
+                                        vision_state.clothes_match_pct = 100
+                                    initial_th = active_lock_box[3]
+                                    smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
+                                    print(f"[TRACKER] Target manusia terkunci & disimpan di memori ({prof_info['name']}) via {current_mode.upper()}!")
+                                else:
+                                    print(f"[ERROR] Gagal membuat tracker {current_mode}!")
 
                 else:
                     success, box = tracker.update(frame)
@@ -1398,7 +1409,8 @@ def main():
                             if curr_hist is not None and target_clothes_hist is not None:
                                 target_clothes_hist = update_clothes_color_signature(target_clothes_hist, curr_hist, alpha=0.96)
 
-                        if match_score >= 0.38 or ai_reanchored:
+                        is_valid_match = (match_score >= 0.55) or (ai_reanchored and match_score >= 0.36)
+                        if is_valid_match:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
@@ -1407,15 +1419,15 @@ def main():
                             status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
                             status_color = (0, 165, 255)
 
-                            # Jika menempel ke objek salah (seperti monitor/dinding selama >= 4 frame):
+                            # Jika menempel ke objek salah (seperti pintu/tembok selama >= 3 frame):
                             # Langsung cari pemilik di seluruh frame secara multi-skala dan paksa kotaki kembali!
-                            if mismatch_streak >= 4:
+                            if mismatch_streak >= 3:
                                 re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                        yunet_detector=yunet_detector,
                                                                        face_cascade=face_cascade,
                                                                        profile_type=current_profile,
                                                                        last_target_box=target_box)
-                                if re_box and re_score >= 0.42:
+                                if re_box and re_score >= 0.52:
                                     print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                     tracker = create_tracker(current_mode)
                                     tracker.init(frame, re_box)
@@ -1435,7 +1447,7 @@ def main():
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile,
                                                                last_target_box=target_box)
-                        if re_box and re_score >= 0.42:
+                        if re_box and re_score >= 0.52:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
@@ -1477,7 +1489,7 @@ def main():
             # Hitung Deviasi Piksel & Estimasi Jarak Monokular
             err_x = 0
             err_y = 0
-            has_target = (target_box is not None) and (mismatch_streak < 3)
+            has_target = (target_box is not None) and (mismatch_streak < 2)
 
             if has_target:
                 tx, ty, tw, th = target_box
