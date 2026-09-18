@@ -1076,12 +1076,13 @@ def main():
     prof_info = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
     box_w, box_h = prof_info["box"]
     init_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
-    active_lock_box = init_box
+    active_lock_box = None
     tracker = None
     target_clothes_hist = None
     tracking_active = False
-    lock_countdown_start = time.time()
-    countdown_duration = 3.0
+    countdown_start = None
+    countdown_duration = 2.0
+    human_last_seen = 0.0
     smooth_distance = 0.0
     dist_status = "SEARCHING"
     last_face_scan = 0
@@ -1136,9 +1137,11 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 3.0
+                    countdown_duration = 2.0
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
-                    lock_countdown_start = time.time()
                     vision_state.trigger_reset = False
                     print("[CONTROL] Reset pelacakan dari Web HUD diterima.")
 
@@ -1149,13 +1152,14 @@ def main():
                     prof_info = TARGET_PROFILES.get(current_profile, TARGET_PROFILES["torso"])
                     box_w, box_h = prof_info["box"]
                     init_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
-                    active_lock_box = init_box
+                    active_lock_box = None
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 3.0
+                    countdown_duration = 2.0
+                    countdown_start = None
+                    human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
-                    lock_countdown_start = time.time()
                     print(f"[CONTROL] Profil target diubah ke '{prof_info['name']}'.")
 
                 if vision_state.change_mode_req:
@@ -1165,9 +1169,11 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
-                    countdown_duration = 3.0
+                    countdown_duration = 2.0
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                     vision_state.clothes_match_pct = 100
-                    lock_countdown_start = time.time()
                     print(f"[CONTROL] Ganti mode ke '{current_mode.upper()}' dari Web HUD.")
 
             # Cek perintah Click-to-Track manual dari Web HUD
@@ -1266,18 +1272,19 @@ def main():
                     else:
                         center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
 
-                        # Smart Human Detection: Cek keberadaan manusia sebelum memulai hitung mundur
-                        ai_detected = False
-                        if now - last_face_scan > 0.08:
+                        # Smart Human Detection: Scan setiap 0.06 detik (~16 fps) untuk mendeteksi manusia
+                        if now - last_face_scan > 0.06:
                             last_face_scan = now
+                            found_human = False
                             if yunet_detector:
                                 ai_faces = run_yunet_detection(yunet_detector, frame)
                                 if len(ai_faces) > 0:
                                     fx, fy, fw, fh, _ = ai_faces[0]
                                     active_lock_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
-                                    ai_detected = True
+                                    human_last_seen = now
+                                    found_human = True
 
-                            if not ai_detected and face_cascade:
+                            if not found_human and face_cascade:
                                 try:
                                     gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                                     faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
@@ -1285,13 +1292,17 @@ def main():
                                         faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
                                         fx, fy, fw, fh = faces_found[0]
                                         active_lock_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
-                                        ai_detected = True
+                                        human_last_seen = now
+                                        found_human = True
                                 except Exception:
                                     pass
 
-                        if not ai_detected:
+                        # Manusia dianggap aktif jika terdeteksi dalam 0.6 detik terakhir (toleransi flicker scan)
+                        human_present = (now - human_last_seen < 0.6) and (active_lock_box is not None)
+
+                        if not human_present:
                             # TIDAK ADA MANUSIA: Jangan pernah hitung mundur dan jangan mengunci pintu/tembok kosong!
-                            lock_countdown_start = now  # Reset timer terus-menerus
+                            countdown_start = None
                             status_text = "MENUNGGU_MAJIKAN"
                             status_color = (0, 200, 255)
                             cx, cy, cw, ch = center_box
@@ -1303,9 +1314,12 @@ def main():
                             cv2.putText(annotated_frame, "STANDBY: MENUNGGU MAJIKAN...", (cx, max(14, cy - 8)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
                         else:
-                            # ADA MANUSIA TERDETEKSI: Jalankan hitung mundur 3 detik untuk merekam target
-                            elapsed = now - lock_countdown_start
-                            remaining = countdown_duration - elapsed
+                            # ADA MANUSIA TERDETEKSI: Jalankan hitung mundur 2 detik untuk merekam target
+                            if countdown_start is None:
+                                countdown_start = now
+
+                            elapsed = now - countdown_start
+                            remaining = max(0.0, countdown_duration - elapsed)
                             x, y, w, h = active_lock_box
 
                             if remaining > 0:
@@ -1326,12 +1340,16 @@ def main():
                                     tracking_active = True
                                     target_box = list(active_lock_box)
                                     mismatch_streak = 0
+                                    countdown_start = None
                                     with vision_state.lock:
                                         vision_state.clothes_match_pct = 100
                                     initial_th = active_lock_box[3]
                                     smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
+                                    status_text = "LOCKED_TRACKING (100%)"
+                                    status_color = (0, 255, 0)
                                     print(f"[TRACKER] Target manusia terkunci & disimpan di memori ({prof_info['name']}) via {current_mode.upper()}!")
                                 else:
+                                    countdown_start = None
                                     print(f"[ERROR] Gagal membuat tracker {current_mode}!")
 
                 else:
@@ -1403,13 +1421,13 @@ def main():
                             vision_state.clothes_match_pct = clothes_pct
 
                         # 3. Model Adaptation (EMA):
-                        # Jika kecocokan sangat tinggi (>= 68%), adaptasikan sedikit variasi pencahayaan
-                        if match_score >= 0.68:
+                        # Jika kecocokan sangat tinggi (>= 65%), adaptasikan sedikit variasi pencahayaan
+                        if match_score >= 0.65:
                             curr_hist = get_clothes_color_signature(frame, target_box)
                             if curr_hist is not None and target_clothes_hist is not None:
                                 target_clothes_hist = update_clothes_color_signature(target_clothes_hist, curr_hist, alpha=0.96)
 
-                        is_valid_match = (match_score >= 0.55) or (ai_reanchored and match_score >= 0.36)
+                        is_valid_match = (match_score >= 0.45) or (ai_reanchored and match_score >= 0.30)
                         if is_valid_match:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
@@ -1666,21 +1684,33 @@ def main():
                     break
                 elif key == ord('r'):
                     tracking_active = False
-                    lock_countdown_start = time.time()
+                    target_clothes_hist = None
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                 elif key == ord('m'):
                     current_mode = "face" if current_mode == "kcf" else "kcf"
                     tracking_active = False
-                    lock_countdown_start = time.time()
+                    target_clothes_hist = None
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                 elif key == ord('f'):
                     with vision_state.lock:
                         vision_state.mirror = not vision_state.mirror
                     tracking_active = False
-                    lock_countdown_start = time.time()
+                    target_clothes_hist = None
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                 elif key == ord('v'):
                     with vision_state.lock:
                         vision_state.flip_v = not vision_state.flip_v
                     tracking_active = False
-                    lock_countdown_start = time.time()
+                    target_clothes_hist = None
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
                 elif key == ord('p'):
                     profiles = ["body", "torso", "face"]
                     idx = (profiles.index(current_profile) + 1) % len(profiles)
@@ -1688,7 +1718,10 @@ def main():
                     with vision_state.lock:
                         vision_state.target_profile = current_profile
                     tracking_active = False
-                    lock_countdown_start = time.time()
+                    target_clothes_hist = None
+                    countdown_start = None
+                    active_lock_box = None
+                    human_last_seen = 0.0
 
     except KeyboardInterrupt:
         print("\n[STOP] Program dihentikan pengguna.")
