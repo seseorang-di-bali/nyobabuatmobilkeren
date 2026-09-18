@@ -583,9 +583,10 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             for cnt in contours:
                 ca = cv2.contourArea(cnt)
                 if ca > 400:  # Blob pergerakan manusia
-                    cx, cy, cw, ch = cv2.boundingRect(cnt)
-                    cand_w = max(base_box_w, min(FRAME_WIDTH, cw + 8))
-                    cand_h = max(base_box_h, min(FRAME_HEIGHT, ch + 16))
+                    max_w = min(130, int(FRAME_WIDTH * 0.40))
+                    max_h = min(165, int(FRAME_HEIGHT * 0.68))
+                    cand_w = max(base_box_w, min(max_w, cw + 8))
+                    cand_h = max(base_box_h, min(max_h, ch + 16))
                     bx = max(0, min(FRAME_WIDTH - cand_w, cx + cw // 2 - cand_w // 2))
                     by = max(0, min(FRAME_HEIGHT - cand_h, cy))
                     test_b = (bx, by, cand_w, cand_h)
@@ -1925,37 +1926,27 @@ def main():
                                     human_last_seen = now
                                     found_human = True
 
-                            # Fallback Haar Cascade (HANYA jika YuNet AI tidak tersedia)
-                            if not found_human and not yunet_detector and face_cascade:
+                            # Fallback Jarak Dekat / Manusia Bergerak (Close-up Torso):
+                            # Jika kepala terpotong di atas frame, deteksi pergerakan manusia di seluruh bidang frame
+                            if not found_human and frame_diff is not None:
                                 try:
-                                    gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                    faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
-                                    if len(faces_found) > 0:
-                                        faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
-                                        fx, fy, fw, fh = faces_found[0]
-                                        active_lock_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
-                                        human_last_seen = now
-                                        found_human = True
-                                except Exception:
-                                    pass
-
-                            # Fallback Jarak Dekat (Close-up Torso):
-                            # Jika kepala terpotong di atas frame, periksa apakah kotak tengah diisi oleh tubuh manusia
-                            if not found_human:
-                                try:
-                                    cx, cy, cw, ch = center_box
-                                    c_roi = frame[cy:cy+ch, cx:cx+cw]
-                                    if c_roi.size > 0:
-                                        c_gray = cv2.cvtColor(c_roi, cv2.COLOR_BGR2GRAY)
-                                        c_std = float(np.std(c_gray))
-                                        c_mot = compute_box_motion(frame_diff, center_box) if frame_diff is not None else 0.0
-                                        # Pakaian dan badan manusia memiliki variansi tekstur nyata (> 18.0)
-                                        # DAN wajib memiliki denyut gerakan dinamis (> 2.0).
-                                        # Benda mati (gantungan baju, kursi, gorden, kasur) memiliki mot < 0.8 sehingga dilarang memicu auto-lock!
-                                        if c_std > 18.0 and c_mot > 2.0:
-                                            active_lock_box = center_box
-                                            human_last_seen = now
-                                            found_human = True
+                                    _, mb_th = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
+                                    mb_blur = cv2.boxFilter(mb_th, -1, (15, 15))
+                                    mb_cnts, _ = cv2.findContours(mb_blur, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                    best_m_ca = 0
+                                    for cnt in mb_cnts:
+                                        ca = cv2.contourArea(cnt)
+                                        if ca > 600:  # Pergerakan tubuh manusia aktif
+                                            cx, cy, cw, ch = cv2.boundingRect(cnt)
+                                            if ca > best_m_ca:
+                                                best_m_ca = ca
+                                                bw_c = min(120, max(box_w, cw))
+                                                bh_c = min(160, max(box_h, ch))
+                                                mbx = max(0, min(FRAME_WIDTH - bw_c, cx + cw // 2 - bw_c // 2))
+                                                mby = max(0, min(FRAME_HEIGHT - bh_c, cy))
+                                                active_lock_box = (mbx, mby, bw_c, bh_c)
+                                                human_last_seen = now
+                                                found_human = True
                                 except Exception:
                                     pass
 
@@ -2020,6 +2011,10 @@ def main():
                     if success:
                         target_box = [int(v) for v in box]
                         bx, by, bw, bh = target_box
+
+                        # Safety Clamp Mutlak: Tolak jika kotak membesar melebihi ukuran manusia normal (seisi ruangan)
+                        if bw > 150 or bh > 185 or (bw * bh > FRAME_WIDTH * FRAME_HEIGHT * 0.35):
+                            success = False
 
                         # 1. AI Anchor & Dynamic Scale Correction (Setiap 4 frame):
                         # Menggunakan YuNet Neural Net untuk menjaga kotak tetap melekat di tengah badan,
@@ -2099,38 +2094,54 @@ def main():
                         else:
                             static_streak = max(0, static_streak - 2)
 
-                        # Jika terkunci pada benda mati selama >= 10 frame (~0.33 detik):
+                        # Jika terkunci pada benda mati selama >= 10 frame (~0.3 detik):
                         if static_streak >= 10:
-                            cand_box, cand_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
-                                                                        yunet_detector=yunet_detector,
-                                                                        face_cascade=face_cascade,
-                                                                        profile_type=current_profile,
-                                                                        frame_diff=frame_diff)
-                            if cand_box and cand_score >= 0.50:
-                                cand_mot = compute_box_motion(frame_diff, cand_box) if frame_diff is not None else 0.0
-                                if cand_mot > 1.8 or cand_score > match_score + 0.08:
-                                    print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}%), beralih ke majikan bergerak di {cand_box} ({int(cand_score*100)}%, mot={cand_mot:.1f}%)!")
-                                    tracker = create_tracker(current_mode)
-                                    if tracker:
-                                        tracker.init(frame, cand_box)
-                                        target_box = list(cand_box)
-                                        static_streak = 0
-                                        mismatch_streak = 0
-                                        match_score = cand_score
-                                        clothes_pct = int(match_score * 100)
-                            elif static_streak >= 25 and match_score < 0.50:
-                                # Sudah diam >= 25 frame dan skor baju rendah (<50%) -> lepas kuncian benda mati
-                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}%, match={clothes_pct}% < 50%). Melepas kuncian!")
-                                tracking_active = False
-                                target_box = None
-                                static_streak = 0
-                                scanning_owner_start = now
-                                status_text = "SCANNING_OWNER"
-                                status_color = (0, 165, 255)
-                            elif static_streak >= 30 and not ai_reanchored:
-                                # Target membisu total tanpa denyut gerak dan tanpa wajah selama ~1 detik (30 frame).
-                                # Manusia hidup selalu memiliki mikrogelombang gerak (napas, geser bahu) atau wajah.
-                                # Jika benar-benar membisu (mot < 1.0%), ini 100% benda mati (kain gantung, rak, kursi)!
+                            # 1. Cari apakah ada orang bergerak di frame (Universal Motion Override)
+                            active_moving_box = None
+                            if frame_diff is not None:
+                                try:
+                                    _, d_th = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
+                                    d_blur = cv2.boxFilter(d_th, -1, (15, 15))
+                                    d_cnts, _ = cv2.findContours(d_blur, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                    best_ca = 0
+                                    for cnt in d_cnts:
+                                        ca = cv2.contourArea(cnt)
+                                        if ca > 500:  # Blob pergerakan manusia
+                                            mcx, mcy, mcw, mch = cv2.boundingRect(cnt)
+                                            # Pastikan pergerakan bukan di posisi objek diam yang sedang terkunci
+                                            overlap_x = max(0, min(bx + bw, mcx + mcw) - max(bx, mcx))
+                                            overlap_y = max(0, min(by + bh, mcy + mch) - max(by, mcy))
+                                            if (overlap_x * overlap_y) < (mcw * mch * 0.40):
+                                                if ca > best_ca:
+                                                    best_ca = ca
+                                                    bw_c = min(120, max(box_w, mcw))
+                                                    bh_c = min(160, max(box_h, mch))
+                                                    mbx = max(0, min(FRAME_WIDTH - bw_c, mcx + mcw // 2 - bw_c // 2))
+                                                    mby = max(0, min(FRAME_HEIGHT - bh_c, mcy))
+                                                    active_moving_box = (mbx, mby, bw_c, bh_c)
+                                except Exception:
+                                    pass
+
+                            # Jika ada orang bergerak di frame: EJECT BENDA MATI & ALIKAN KUNCIAN KE MANUSIA!
+                            if active_moving_box is not None:
+                                print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}%), otomatis BERALIH ke majikan bergerak di {active_moving_box}!")
+                                tracker = create_tracker(current_mode)
+                                if tracker:
+                                    tracker.init(frame, active_moving_box)
+                                    target_clothes_hist = get_clothes_color_signature(frame, active_moving_box)
+                                    target_box = list(active_moving_box)
+                                    static_streak = 0
+                                    mismatch_streak = 0
+                                    countdown_start = None
+                                    scanning_owner_start = None
+                                    with vision_state.lock:
+                                        vision_state.clothes_match_pct = 100
+                                    match_score = 1.0
+                                    clothes_pct = 100
+                                    status_text = "LOCKED_TRACKING (100%)"
+                                    status_color = (0, 255, 0)
+                            elif static_streak >= 20 and not ai_reanchored:
+                                # Sudah diam total >= 20 frame (~0.6-0.8s) tanpa ada wajah YuNet
                                 print(f"[ANTI-BENDA-MATI] Target diam membisu tanpa wajah/gerak (mot={box_motion:.1f}%, streak={static_streak}). Melepas kuncian benda mati!")
                                 tracking_active = False
                                 target_box = None
