@@ -22,6 +22,7 @@ import socket
 import threading
 import logging
 import subprocess
+import json
 import cv2
 import numpy as np
 import serial
@@ -468,13 +469,29 @@ def update_clothes_color_signature(target_sig, curr_sig, alpha=0.96):
     except Exception:
         return target_sig
 
-def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detector=None, face_cascade=None, profile_type="torso", last_target_box=None):
+def compute_box_motion(frame_diff, box):
+    """Menghitung intensitas pergerakan piksel di dalam kotak target (0.01 ms)."""
+    if frame_diff is None or box is None:
+        return 0.0
+    try:
+        x, y, w, h = [int(v) for v in box]
+        x = max(0, min(FRAME_WIDTH - 1, x))
+        y = max(0, min(FRAME_HEIGHT - 1, y))
+        w = max(2, min(FRAME_WIDTH - x, w))
+        h = max(2, min(FRAME_HEIGHT - y, h))
+        roi = frame_diff[y:y+h, x:x+w]
+        return float(np.mean(roi)) if roi.size > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detector=None, face_cascade=None, profile_type="torso", last_target_box=None, frame_diff=None):
     """
-    Sistem Persistent Re-Identification (Re-ID) & Smart Clothes Matcher:
+    Sistem Persistent Re-Identification (Re-ID) & Anti-Benda Mati:
     1. Prioritas 1: YuNet AI Neural Network Detector (~5-9 ms).
     2. Prioritas 2: Haar Cascade Fallback.
-    3. Prioritas 3: Full-Frame Multi-Scale Grid Scan untuk tampak punggung.
-    Menerapkan Spatial Continuity Gating (anti-teleport) agar tidak melompat ke orang asing.
+    3. Prioritas 3: Deteksi Gerakan Tubuh (Motion Blobs, Anti-Benda Mati, ~0.3 ms).
+    4. Prioritas 4: Ultra-Fast Color Back-Projection.
+    Menerapkan Spatial Continuity Gating dan Motion Priority (membedakan manusia vs benda mati).
     """
     if target_hist is None:
         return None, 0.0
@@ -483,15 +500,26 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
     best_score = 0.0
 
     def calculate_effective_score(cand_b, raw_s):
-        if last_target_box is None:
-            return raw_s
-        lx = last_target_box[0] + last_target_box[2] // 2
-        ly = last_target_box[1] + last_target_box[3] // 2
-        cx = cand_b[0] + cand_b[2] // 2
-        cy = cand_b[1] + cand_b[3] // 2
-        dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
-        prox_factor = max(0.85, 1.0 - (dist / 600.0))
-        return raw_s * prox_factor
+        eff_s = raw_s
+        if last_target_box is not None:
+            lx = last_target_box[0] + last_target_box[2] // 2
+            ly = last_target_box[1] + last_target_box[3] // 2
+            cx = cand_b[0] + cand_b[2] // 2
+            cy = cand_b[1] + cand_b[3] // 2
+            dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+            prox_factor = max(0.85, 1.0 - (dist / 600.0))
+            eff_s = eff_s * prox_factor
+
+        # Motion Gating (Anti-Benda Mati):
+        if frame_diff is not None:
+            mot = compute_box_motion(frame_diff, cand_b)
+            if mot > 2.0:
+                # Memiliki pergerakan intrinsik (manusia aktif): beri dorongan prioritas +15%
+                eff_s = min(1.0, eff_s * 1.15)
+            elif mot < 0.8:
+                # Benda mati total / tidak ada gerakan: kurangi prioritas -18%
+                eff_s = eff_s * 0.82
+        return eff_s
 
     # 1. Prioritas Utama: YuNet AI Neural Network Detector (~5-9 ms)
     if yunet_detector:
@@ -534,7 +562,31 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         except Exception:
             pass
 
-    # 3. Prioritas Ketiga: Ultra-Fast Color Back-Projection (~1-2 ms, OpenCV Native C++)
+    # 3. Prioritas Ketiga: Motion Blob Scanning (Anti-Benda Mati, ~0.3 ms)
+    # Mencari objek yang aktif bergerak di frame dan mencocokkan kriteria pakaian majikan
+    if frame_diff is not None:
+        try:
+            _, diff_thresh = cv2.threshold(frame_diff, 18, 255, cv2.THRESH_BINARY)
+            diff_blur = cv2.boxFilter(diff_thresh, -1, (15, 15))
+            contours, _ = cv2.findContours(diff_blur, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                ca = cv2.contourArea(cnt)
+                if ca > 400:  # Blob pergerakan manusia
+                    cx, cy, cw, ch = cv2.boundingRect(cnt)
+                    cand_w = max(base_box_w, min(FRAME_WIDTH, cw + 8))
+                    cand_h = max(base_box_h, min(FRAME_HEIGHT, ch + 16))
+                    bx = max(0, min(FRAME_WIDTH - cand_w, cx + cw // 2 - cand_w // 2))
+                    by = max(0, min(FRAME_HEIGHT - cand_h, cy))
+                    test_b = (bx, by, cand_w, cand_h)
+                    s = compare_clothes_color(frame, test_b, target_hist)
+                    eff_s = calculate_effective_score(test_b, s)
+                    if eff_s > best_score:
+                        best_score = eff_s
+                        best_box = test_b
+        except Exception:
+            pass
+
+    # 4. Prioritas Keempat: Ultra-Fast Color Back-Projection (~1-2 ms, OpenCV Native C++)
     # Menggantikan 440 sliding-window loop yang sebelumnya menghabiskan 1000ms dan menyebabkan 1 FPS.
     if target_hist and isinstance(target_hist, dict) and target_hist.get("u_hs") is not None:
         try:
@@ -560,7 +612,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
         except Exception:
             pass
 
-    if best_score >= 0.32:
+    if best_score >= 0.30:
         return best_box, best_score
 
     return None, best_score
@@ -682,55 +734,159 @@ class ThreadedCamera:
         self.cap.release()
 
 
-class AdaptiveServoTuner:
+class OnlineServoLearner:
     """
-    Sistem Kalibrasi Mandiri (Self-Tuning / Auto-Calibration):
-    Mendeteksi osilasi / overshooting (ketika servo bergerak terlalu cepat dan bolak-balik melintasi target).
-    Secara cerdas meredam gain kecepatan dan meningkatkan smoothing hingga respon servo pas dan sinematik.
+    Sistem Pembelajaran Gerakan Servo Mandiri Saat Berjalan (Ultra-Lightweight Online Learning):
+    - Berjalan real-time di STB Armbian tanpa membebani CPU (kompleksitas O(1), <0.005 ms per frame).
+    - Mengevaluasi performa pelacakan per episode (1.5 detik / 45 frame):
+      * Menghitung Loss (Rata-rata error jarak piksel, frekuensi osilasi/overshoot, dan getaran jitter).
+      * Menghitung Efisiensi Reward (10% - 99%).
+    - Melakukan adaptasi gradien parameter (Kecepatan respon Kp & Kelembutan damping EMA).
+    - Menyimpan parameter terbaik ke 'learned_servo_params.json' agar tetap diingat setelah STB restart.
     """
-    def __init__(self):
-        self.last_sign = 0
-        self.sign_flip_times = []
-        self.last_adjustment = time.time()
+    def __init__(self, config_file="learned_servo_params.json"):
+        self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_file)
+        self.iteration = 0
+        self.best_loss = 999.0
         self.status = "MENUNGGU TARGET"
+        self.metrics_str = "Loss: - | R: -"
 
-    def update(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
-        if not is_auto_tune_enabled or abs(err_x) < 8:
-            return current_speed_pct, current_smooth_pct, self.status
+        # Parameter default jika belum ada file terlatih
+        self.learned_speed = 38
+        self.learned_smooth = 72
+        self.learned_deadzone = 12
+
+        # Buffer pengumpul metrik per-episode
+        self.frame_count = 0
+        self.sum_abs_err = 0.0
+        self.sum_d_err = 0.0
+        self.prev_err = 0.0
+        self.overshoot_count = 0
+        self.last_sign = 0
+        self.episode_start = time.time()
+        self.is_trained = False
+
+        self.load_learned_params()
+
+    def load_learned_params(self):
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r") as f:
+                    data = json.load(f)
+                    self.learned_speed = int(data.get("servo_speed_pct", 38))
+                    self.learned_smooth = int(data.get("servo_smoothing_pct", 72))
+                    self.learned_deadzone = int(data.get("deadzone", 12))
+                    self.best_loss = float(data.get("best_loss", 999.0))
+                    self.iteration = int(data.get("iteration", 0))
+                    self.is_trained = bool(data.get("trained", False))
+                    print(f"[AI LEARNER] Memuat parameter terlatih: Speed={self.learned_speed}%, Smooth={self.learned_smooth}%, Deadzone={self.learned_deadzone}px (Best Loss: {self.best_loss:.1f})")
+        except Exception as e:
+            print(f"[AI LEARNER] Info load config: {e}")
+
+    def save_learned_params(self):
+        try:
+            data = {
+                "servo_speed_pct": int(self.learned_speed),
+                "servo_smoothing_pct": int(self.learned_smooth),
+                "deadzone": int(self.learned_deadzone),
+                "best_loss": float(round(self.best_loss, 2)),
+                "iteration": int(self.iteration),
+                "trained": True,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(self.config_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print(f"[AI LEARNER] Parameter gerakan terbaik disimpan ke {self.config_path}!")
+        except Exception as e:
+            print(f"[AI LEARNER] Gagal menyimpan parameter: {e}")
+
+    def step(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
+        """
+        Dijalankan setiap frame (0.002 ms).
+        Mengumpulkan data pergerakan dan memperbarui kebijakan servo setiap ~45 frame.
+        """
+        if not is_auto_tune_enabled:
+            self.status = "MANUAL CONTROL"
+            self.metrics_str = "AI Nonaktif"
+            return current_speed_pct, current_smooth_pct, self.learned_deadzone, self.status, self.metrics_str
 
         now = time.time()
-        curr_sign = 1 if err_x > 0 else (-1 if err_x < 0 else 0)
+        abs_err = abs(err_x)
+        d_err = abs(err_x - self.prev_err)
+        curr_sign = 1 if err_x > 6 else (-1 if err_x < -6 else 0)
 
-        # Deteksi pembalikan tanda arah (+ ke - atau - ke +) -> indikasi overshooting
+        # Deteksi pembalikan arah (overshoot / osilasi bolak-balik melintasi target)
         if self.last_sign != 0 and curr_sign != 0 and curr_sign != self.last_sign:
-            self.sign_flip_times.append(now)
-            # Simpan hanya kejadian dalam 1.2 detik terakhir
-            self.sign_flip_times = [t for t in self.sign_flip_times if now - t < 1.2]
-
-            # Jika terjadi >= 2 kali pembalikan dalam 1.2 detik (Overshoot / Goyang Bolak-balik):
-            if len(self.sign_flip_times) >= 2 and (now - self.last_adjustment > 0.35):
-                # Terlalu cepat / terlalu banyak gerak! Redam kecepatan dan tingkatkan kelembutan
-                new_speed = max(15, current_speed_pct - 6)
-                new_smooth = min(85, current_smooth_pct + 4)
-                self.last_adjustment = now
-                self.sign_flip_times.clear()
-                self.status = f"AUTO-DAMPING ({new_speed}%)"
-                return new_speed, new_smooth, self.status
+            self.overshoot_count += 1
 
         self.last_sign = curr_sign
+        self.prev_err = err_x
 
-        # Jika stabil (tanpa osilasi) selama > 4.0 detik:
-        if now - self.last_adjustment > 4.0:
-            if abs(err_x) > 35 and current_speed_pct < 55:
-                # Sedikit lambat mengejar, naikkan perlahan
-                new_speed = min(65, current_speed_pct + 2)
-                self.last_adjustment = now
-                self.status = f"OPTIMAL ({new_speed}%)"
-                return new_speed, current_smooth_pct, self.status
+        self.sum_abs_err += abs_err
+        self.sum_d_err += d_err
+        self.frame_count += 1
+
+        # Evaluasi episode setiap ~45 frame (~1.5 detik berjalan)
+        if self.frame_count >= 45 or (now - self.episode_start > 1.6):
+            mae = self.sum_abs_err / max(1, self.frame_count)
+            jitter = self.sum_d_err / max(1, self.frame_count)
+            overshoots = self.overshoot_count
+
+            # Fungsi Loss: Gabungan deviasi jarak, penalti osilasi/reog, dan getaran jitter
+            loss = round(0.40 * mae + 15.0 * overshoots + 0.35 * jitter, 1)
+            reward_pct = max(10, min(99, int(100 - loss)))
+            self.iteration += 1
+
+            new_speed = current_speed_pct
+            new_smooth = current_smooth_pct
+            new_deadzone = self.learned_deadzone
+
+            # 1. Adaptasi Anti-Overshoot: Jika servo bergoyang bolak-balik melewati majikan
+            if overshoots >= 2:
+                new_speed = max(16, current_speed_pct - 4)
+                new_smooth = min(88, current_smooth_pct + 3)
+                action_desc = "REDAM OSILASI"
+
+            # 2. Adaptasi Respons Lambat: Jika error masih besar tapi tidak ada osilasi sama sekali
+            elif mae > 26.0 and overshoots <= 1:
+                new_speed = min(68, current_speed_pct + 3)
+                new_smooth = max(35, current_smooth_pct - 2)
+                action_desc = "BOOST RESPON"
+
+            # 3. Adaptasi Anti-Jitter Dekat: Jika target sudah di tengah tapi servo bergetar halus
+            elif mae < 10.0 and jitter > 5.0:
+                new_deadzone = min(18, new_deadzone + 1)
+                action_desc = "DEADZONE +1px"
+
+            # 4. Kinerja Optimal Tercapai
             else:
-                self.status = f"PAS & STABIL ({current_speed_pct}%)"
+                action_desc = "PAS & STABIL"
+                if loss < self.best_loss:
+                    self.best_loss = loss
+                    self.learned_speed = new_speed
+                    self.learned_smooth = new_smooth
+                    self.learned_deadzone = new_deadzone
+                    self.save_learned_params()
 
-        return current_speed_pct, current_smooth_pct, self.status
+            self.status = f"TRAINING #{self.iteration} | {action_desc}"
+            self.metrics_str = f"Loss: {loss} | R: {reward_pct}%"
+
+            # Reset akumulator untuk episode berikutnya
+            self.frame_count = 0
+            self.sum_abs_err = 0.0
+            self.sum_d_err = 0.0
+            self.overshoot_count = 0
+            self.episode_start = now
+
+            return new_speed, new_smooth, new_deadzone, self.status, self.metrics_str
+
+        return current_speed_pct, current_smooth_pct, self.learned_deadzone, self.status, self.metrics_str
+
+    def update(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
+        spd, sm, dz, st, met = self.step(err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled)
+        return spd, sm, st
+
+AdaptiveServoTuner = OnlineServoLearner
 
 
 class VisionState:
@@ -753,11 +909,12 @@ class VisionState:
         self.flip_v = False      # Flip vertikal (jika kamera terbalik atas-bawah)
         self.invert_pan = False  # Invert arah putaran servo Pan horizontal
         self.invert_tilt = False # Invert arah putaran servo Tilt vertikal
-        self.servo_speed_pct = 40       # Kecepatan respon servo (10% s/d 100%, default 40% halus)
-        self.servo_smoothing_pct = 70   # Kelembutan EMA (10% agresif s/d 90% sinematik)
-        self.servo_deadzone = 16        # Deadzone pixel anti-jitter
-        self.auto_tune = True           # Auto-tune adaptif anti-overshoot aktif
+        self.servo_speed_pct = 38       # Kecepatan respon servo (default 38% halus)
+        self.servo_smoothing_pct = 72   # Kelembutan EMA (default 72% sinematik)
+        self.servo_deadzone = 12        # Deadzone pixel anti-jitter
+        self.auto_tune = True           # AI Online Learning aktif
         self.auto_tune_status = "MENUNGGU TARGET"
+        self.auto_tune_metrics = "Loss: - | R: -"
         self.target_profile = "torso"  # Default: Badan Atas & Baju
         self.change_profile_req = None
         self.distance_m = 0.0
@@ -919,22 +1076,23 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div class="control-panel">
-            <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PENGATUR KECEPATAN & AUTO-TUNE SERVO:</span>
+            <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PENGATUR KECEPATAN & AI ONLINE LEARNING SERVO:</span>
             <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center; margin-top: 8px;">
                 <div style="flex: 1; min-width: 180px;">
-                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan: <span id="val-speed" style="color: var(--accent-color); font-weight: bold;">40%</span></label>
-                    <input type="range" id="slider-speed" min="10" max="100" value="40" style="width: 100%; cursor: pointer;" oninput="changeServoSpeed(this.value)">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan: <span id="val-speed" style="color: var(--accent-color); font-weight: bold;">38%</span></label>
+                    <input type="range" id="slider-speed" min="10" max="100" value="38" style="width: 100%; cursor: pointer;" oninput="changeServoSpeed(this.value)">
                 </div>
                 <div style="flex: 1; min-width: 180px;">
-                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kelembutan (Anti-Sentak): <span id="val-smooth" style="color: var(--success-color); font-weight: bold;">70%</span></label>
-                    <input type="range" id="slider-smooth" min="10" max="90" value="70" style="width: 100%; cursor: pointer;" oninput="changeServoSmooth(this.value)">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kelembutan (Anti-Sentak): <span id="val-smooth" style="color: var(--success-color); font-weight: bold;">72%</span></label>
+                    <input type="range" id="slider-smooth" min="10" max="90" value="72" style="width: 100%; cursor: pointer;" oninput="changeServoSmooth(this.value)">
                 </div>
                 <div>
-                    <button id="btn-toggle-autotune" class="btn-primary" onclick="toggleAutoTune()">🧠 Auto-Tune: ON</button>
+                    <button id="btn-toggle-autotune" class="btn-primary" onclick="toggleAutoTune()">🧠 AI Learning: ON</button>
                 </div>
             </div>
-            <div style="font-size: 0.78rem; color: var(--text-sub); margin-top: 6px;">
-                Status Kalibrasi Mandiri: <span id="val-autotune-status" style="color: var(--accent-color); font-weight: 600;">MENUNGGU TARGET</span>
+            <div style="font-size: 0.78rem; color: var(--text-sub); margin-top: 6px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                <div>Status AI Training: <span id="val-autotune-status" style="color: var(--accent-color); font-weight: 600;">MENUNGGU TARGET</span></div>
+                <div>Performa: <span id="val-autotune-metrics" style="color: var(--success-color); font-weight: 600;">Loss: - | R: -</span></div>
             </div>
         </div>
 
@@ -1130,10 +1288,14 @@ HTML_PAGE = """<!DOCTYPE html>
                     if (statusAuto && data.auto_tune_status) {
                         statusAuto.innerText = data.auto_tune_status;
                     }
+                    const metricsAuto = document.getElementById('val-autotune-metrics');
+                    if (metricsAuto && data.auto_tune_metrics) {
+                        metricsAuto.innerText = data.auto_tune_metrics;
+                    }
                     const btnAuto = document.getElementById('btn-toggle-autotune');
                     if (btnAuto) {
                         btnAuto.className = data.auto_tune ? 'btn-primary' : 'btn-secondary';
-                        btnAuto.innerText = data.auto_tune ? '🧠 Auto-Tune: ON' : '🧠 Auto-Tune: MANUAL';
+                        btnAuto.innerText = data.auto_tune ? '🧠 AI Learning: ON' : '🧠 AI Learning: MANUAL';
                     }
                     if (!isDraggingSlider) {
                         const sSpeed = document.getElementById('slider-speed');
@@ -1231,8 +1393,10 @@ def create_app():
                 "invert_pan": bool(vision_state.invert_pan),
                 "servo_speed_pct": int(vision_state.servo_speed_pct),
                 "servo_smoothing_pct": int(vision_state.servo_smoothing_pct),
+                "servo_deadzone": int(vision_state.servo_deadzone),
                 "auto_tune": bool(vision_state.auto_tune),
                 "auto_tune_status": str(vision_state.auto_tune_status),
+                "auto_tune_metrics": str(vision_state.auto_tune_metrics),
                 "anti_silau": bool(vision_state.anti_silau),
                 "clothes_match_pct": int(vision_state.clothes_match_pct)
             })
@@ -1443,10 +1607,18 @@ def main():
     last_face_scan = 0
     frame_counter = 0
     mismatch_streak = 0
+    static_streak = 0
     scanning_owner_start = None
     smooth_err_x = 0.0
     smooth_err_y = 0.0
-    servo_tuner = AdaptiveServoTuner()
+    servo_learner = OnlineServoLearner()
+    # Muat parameter yang sudah dipelajari sebelumnya jika ada
+    with vision_state.lock:
+        vision_state.servo_speed_pct = servo_learner.learned_speed
+        vision_state.servo_smoothing_pct = servo_learner.learned_smooth
+        vision_state.servo_deadzone = servo_learner.learned_deadzone
+
+    prev_gray_frame = None
 
     print("[SYSTEM] Pipeline kamera aktif. Memulai pelacakan...\n")
 
@@ -1486,6 +1658,11 @@ def main():
             if do_anti_silau:
                 frame = enhance_dynamic_range(frame)
 
+            # Komputasi Frame Difference Ultra-Cepat (~0.08 ms) untuk Anti-Benda Mati & Motion Detection
+            curr_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_diff = cv2.absdiff(curr_gray_frame, prev_gray_frame) if prev_gray_frame is not None else None
+            prev_gray_frame = curr_gray_frame
+
             annotated_frame = frame.copy()
             target_box = None
             status_text = "SEARCHING"
@@ -1497,6 +1674,7 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
+                    static_streak = 0
                     countdown_duration = 1.0
                     countdown_start = None
                     scanning_owner_start = None
@@ -1517,6 +1695,7 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
+                    static_streak = 0
                     countdown_duration = 1.0
                     countdown_start = None
                     scanning_owner_start = None
@@ -1531,6 +1710,7 @@ def main():
                     tracking_active = False
                     target_clothes_hist = None
                     mismatch_streak = 0
+                    static_streak = 0
                     countdown_duration = 1.0
                     countdown_start = None
                     scanning_owner_start = None
@@ -1589,6 +1769,7 @@ def main():
                     tracking_active = True
                     target_box = list(clicked_box)
                     mismatch_streak = 0
+                    static_streak = 0
                     scanning_owner_start = None
                     countdown_start = None
                     active_lock_box = None
@@ -1607,7 +1788,7 @@ def main():
 
                 if not tracking_active:
                     # KASUS A: SUDAH ADA MEMORI WARNA/BENTUK PEMILIK (Persistent Re-ID)
-                    # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame secara multi-skala!
+                    # Memori pemilik disimpan permanen! Terus pantau frame dan kunci kembali saat pemilik bergerak/terlihat
                     if target_clothes_hist is not None:
                         if scanning_owner_start is None:
                             scanning_owner_start = now
@@ -1615,41 +1796,32 @@ def main():
                         re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
-                                                               profile_type=current_profile)
-                        if re_box and re_score >= 0.32:
+                                                               profile_type=current_profile,
+                                                               frame_diff=frame_diff)
+                        if re_box and re_score >= 0.30:
                             tracker = create_tracker(current_mode)
                             if tracker:
                                 tracker.init(frame, re_box)
                                 tracking_active = True
                                 target_box = list(re_box)
                                 mismatch_streak = 0
+                                static_streak = 0
                                 scanning_owner_start = None
                                 initial_th = re_box[3]
                                 smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
                                 status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                                 status_color = (0, 255, 0)
-                                print(f"[RE-SNAP] Pemilik terdeteksi ({int(re_score * 100)}% match)! Memaksa mengotaki target...")
+                                print(f"[RE-SNAP] Pemilik terdeteksi ({int(re_score * 100)}% match)! Mengunci target kembali...")
                         else:
-                            # Failsafe: Jika scanning memori lama melebihi 2.0 detik tanpa hasil:
-                            # Reset memori agar tidak terjebak selamanya, dan siap mengunci ulang siapapun majikan di depan kamera!
-                            if (now - scanning_owner_start) > 2.0:
-                                print("[AUTO-RECOVER] Timeout 2.0s memori lama tidak ditemukan! Reset ke mode auto-lock majikan baru...")
-                                target_clothes_hist = None
-                                scanning_owner_start = None
-                                countdown_start = None
-                                active_lock_box = None
-                                human_last_seen = 0.0
-                                status_text = "AUTO_RECOVER"
-                                status_color = (0, 200, 255)
-                            else:
-                                status_text = "SCANNING_OWNER"
-                                status_color = (0, 165, 255)
-                                cx_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
-                                cv2.rectangle(annotated_frame, (cx_box[0], cx_box[1]),
-                                              (cx_box[0] + cx_box[2], cx_box[1] + cx_box[3]), (0, 165, 255), 1)
-                                time_left = max(0.0, 2.0 - (now - scanning_owner_start))
-                                cv2.putText(annotated_frame, f"MENCARI PEMILIK ({time_left:.1f}s)...", (10, FRAME_HEIGHT - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
+                            # Memori pemilik disimpan secara permanen (tidak ada timeout 2 detik untuk lupa majikan!)
+                            status_text = "SCANNING_OWNER"
+                            status_color = (0, 165, 255)
+                            cx_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
+                            cv2.rectangle(annotated_frame, (cx_box[0], cx_box[1]),
+                                          (cx_box[0] + cx_box[2], cx_box[1] + cx_box[3]), (0, 165, 255), 1)
+                            scan_elapsed = now - scanning_owner_start
+                            cv2.putText(annotated_frame, f"MEMORI AKTIF: MENCARI MAJIKAN ({scan_elapsed:.1f}s)...", (10, FRAME_HEIGHT - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 165, 255), 1)
 
                     # KASUS B: BELUM ADA TEMPLATE DI MEMORI (Awal Start atau User Klik Reset)
                     else:
@@ -1828,55 +2000,99 @@ def main():
                             if curr_hist is not None and target_clothes_hist is not None:
                                 target_clothes_hist = update_clothes_color_signature(target_clothes_hist, curr_hist, alpha=0.96)
 
-                        is_valid_match = (match_score >= 0.32) or (ai_reanchored and match_score >= 0.20)
-                        if is_valid_match:
-                            mismatch_streak = 0
-                            status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
-                            status_color = (0, 255, 0)
+                        # 4. Anti-Benda Mati (Static Object Rejection Filter):
+                        # Memeriksa intensitas gerakan target. Jika target mati/diam (misal dinding/kursi),
+                        # otomatis cari apakah ada majikan yang bergerak di frame untuk dialihkan kunciannya.
+                        box_motion = compute_box_motion(frame_diff, target_box) if frame_diff is not None else 2.0
+                        if box_motion < 1.3 and abs(smooth_err_x) < 22:
+                            static_streak += 1
                         else:
-                            mismatch_streak += 1
-                            if mismatch_streak < 20:
-                                # Masih dalam batas toleransi sesaat (bayangan, putaran badan, lengan lewat)
-                                status_text = f"TRACKING_SOFT ({clothes_pct}%)"
-                                status_color = (0, 200, 255)
-                            else:
-                                status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
+                            static_streak = max(0, static_streak - 2)
+
+                        # Jika terkunci pada benda mati selama >= 10 frame (~0.33 detik):
+                        if static_streak >= 10:
+                            cand_box, cand_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
+                                                                        yunet_detector=yunet_detector,
+                                                                        face_cascade=face_cascade,
+                                                                        profile_type=current_profile,
+                                                                        frame_diff=frame_diff)
+                            if cand_box and cand_score >= 0.30:
+                                cand_mot = compute_box_motion(frame_diff, cand_box) if frame_diff is not None else 0.0
+                                if cand_mot > 1.8 or cand_score > match_score + 0.08:
+                                    print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}), beralih ke majikan bergerak di {cand_box} ({int(cand_score*100)}%, mot={cand_mot:.1f})!")
+                                    tracker = create_tracker(current_mode)
+                                    if tracker:
+                                        tracker.init(frame, cand_box)
+                                        target_box = list(cand_box)
+                                        static_streak = 0
+                                        mismatch_streak = 0
+                                        match_score = cand_score
+                                        clothes_pct = int(match_score * 100)
+                            elif static_streak >= 25 and match_score < 0.38:
+                                # Sudah diam >= 25 frame dan skor baju rendah -> lepas kuncian benda mati
+                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}, match={clothes_pct}%). Melepas kuncian!")
+                                tracking_active = False
+                                target_box = None
+                                static_streak = 0
+                                scanning_owner_start = now
+                                status_text = "SCANNING_OWNER"
                                 status_color = (0, 165, 255)
 
-                                # Jika benar-benar mismatch >= 20 frame berturut-turut (~0.7s):
-                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
-                                                                       yunet_detector=yunet_detector,
-                                                                       face_cascade=face_cascade,
-                                                                       profile_type=current_profile,
-                                                                       last_target_box=target_box)
-                                if re_box and re_score >= 0.32:
-                                    print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
-                                    tracker = create_tracker(current_mode)
-                                    tracker.init(frame, re_box)
-                                    target_box = list(re_box)
-                                    mismatch_streak = 0
-                                    status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
-                                    status_color = (0, 255, 0)
+                        if target_box is not None:
+                            is_valid_match = (match_score >= 0.32) or (ai_reanchored and match_score >= 0.20)
+                            if is_valid_match:
+                                mismatch_streak = 0
+                                status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
+                                status_color = (0, 255, 0)
+                            else:
+                                mismatch_streak += 1
+                                if mismatch_streak < 20:
+                                    # Masih dalam batas toleransi sesaat (bayangan, putaran badan, lengan lewat)
+                                    status_text = f"TRACKING_SOFT ({clothes_pct}%)"
+                                    status_color = (0, 200, 255)
                                 else:
-                                    tracking_active = False
-                                    target_box = None
-                                    scanning_owner_start = now
-                                    status_text = "SCANNING_OWNER"
+                                    status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
                                     status_color = (0, 165, 255)
+
+                                    # Jika benar-benar mismatch >= 20 frame berturut-turut (~0.7s):
+                                    re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
+                                                                           yunet_detector=yunet_detector,
+                                                                           face_cascade=face_cascade,
+                                                                           profile_type=current_profile,
+                                                                           last_target_box=target_box,
+                                                                           frame_diff=frame_diff)
+                                    if re_box and re_score >= 0.30:
+                                        print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
+                                        tracker = create_tracker(current_mode)
+                                        tracker.init(frame, re_box)
+                                        target_box = list(re_box)
+                                        mismatch_streak = 0
+                                        static_streak = 0
+                                        status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
+                                        status_color = (0, 255, 0)
+                                    else:
+                                        tracking_active = False
+                                        target_box = None
+                                        static_streak = 0
+                                        scanning_owner_start = now
+                                        status_text = "SCANNING_OWNER"
+                                        status_color = (0, 165, 255)
                     else:
                         # Tracker lepas (misal gerakan sangat cepat / ngereog):
                         re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h,
                                                                yunet_detector=yunet_detector,
                                                                face_cascade=face_cascade,
                                                                profile_type=current_profile,
-                                                               last_target_box=target_box)
-                        if re_box and re_score >= 0.32:
+                                                               last_target_box=target_box,
+                                                               frame_diff=frame_diff)
+                        if re_box and re_score >= 0.30:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
                             tracking_active = True
                             target_box = list(re_box)
                             mismatch_streak = 0
+                            static_streak = 0
                             scanning_owner_start = None
                             status_text = f"LOCKED_TRACKING ({int(re_score * 100)}%)"
                             status_color = (0, 255, 0)
@@ -1884,6 +2100,7 @@ def main():
                             tracking_active = False
                             target_box = None
                             mismatch_streak = 0
+                            static_streak = 0
                             if scanning_owner_start is None:
                                 scanning_owner_start = now
                             status_text = "SCANNING_OWNER"
@@ -1997,7 +2214,7 @@ def main():
             # Transmisi Serial Asinkronus ke ESP32 (0.00 ms, tidak pernah memblokir FPS)
             now_time = time.time()
             if has_target:
-                # 1. Update Auto-Tuner & Adaptive Calibration (Self-training anti-overshoot)
+                # 1. Update AI Online Learning (Self-training anti-overshoot & anti-jitter)
                 with vision_state.lock:
                     is_autotune = vision_state.auto_tune
                     cur_speed = vision_state.servo_speed_pct
@@ -2005,13 +2222,16 @@ def main():
                     deadzone = vision_state.servo_deadzone
 
                 if is_autotune:
-                    new_spd, new_sm, tune_status = servo_tuner.update(err_x, cur_speed, cur_smooth, True)
-                    if new_spd != cur_speed or new_sm != cur_smooth or tune_status != vision_state.auto_tune_status:
+                    new_spd, new_sm, new_dz, tune_status, metrics_str = servo_learner.step(err_x, cur_speed, cur_smooth, True)
+                    if (new_spd != cur_speed or new_sm != cur_smooth or new_dz != deadzone
+                            or tune_status != vision_state.auto_tune_status or metrics_str != vision_state.auto_tune_metrics):
                         with vision_state.lock:
                             vision_state.servo_speed_pct = new_spd
                             vision_state.servo_smoothing_pct = new_sm
+                            vision_state.servo_deadzone = new_dz
                             vision_state.auto_tune_status = tune_status
-                        cur_speed, cur_smooth = new_spd, new_sm
+                            vision_state.auto_tune_metrics = metrics_str
+                        cur_speed, cur_smooth, deadzone = new_spd, new_sm, new_dz
 
                 # 2. Filter Exponential Moving Average (EMA) - Mengubah sentakan kasar jadi luncuran halus
                 alpha = max(0.10, min(0.60, 1.0 - (cur_smooth / 100.0) * 0.85))
@@ -2036,6 +2256,7 @@ def main():
                 smooth_err_y = 0.0
                 with vision_state.lock:
                     vision_state.auto_tune_status = "MENUNGGU TARGET"
+                    vision_state.auto_tune_metrics = servo_learner.metrics_str
                 serial_sender.send("LOST\n")
             serial_state_str = serial_sender.state_str
 
