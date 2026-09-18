@@ -130,6 +130,91 @@ def find_serial_port():
             pass
     return None
 
+class AsyncSerialSender:
+    """
+    Transmitter Serial Asinkronus (Background Daemon Thread):
+    Menjalankan transmisi data ke ESP32 secara non-blocking di thread terpisah.
+    Menjamin video tracking loop di STB selalu berjalan stabil di 30-40 FPS
+    tanpa pernah terhambat oleh USB buffer blocking atau jeda mikrokontroler.
+    """
+    def __init__(self, port=None, baud=115200, dry_run=False):
+        self.port = port
+        self.baud = baud
+        self.dry_run = dry_run
+        self.ser = None
+        self.lock = threading.Lock()
+        self.latest_msg = "LOST\n"
+        self.state_str = "DRY" if dry_run else "CONNECTING"
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def send(self, msg):
+        with self.lock:
+            self.latest_msg = msg
+
+    def _worker(self):
+        last_reconnect = 0
+        while self.running:
+            if self.dry_run:
+                time.sleep(0.05)
+                continue
+
+            now = time.time()
+            if self.ser is None:
+                if now - last_reconnect > 2.0:
+                    last_reconnect = now
+                    p = self.port or find_serial_port()
+                    if p:
+                        try:
+                            # write_timeout=0.01 & timeout=0.01 memastikan tidak akan pernah memblokir
+                            self.ser = serial.Serial(p, self.baud, timeout=0.01, write_timeout=0.01)
+                            self.state_str = "TX_OK"
+                            with vision_state.lock:
+                                vision_state.serial_state = "TX_OK"
+                                vision_state.serial_port = p
+                            print(f"[SERIAL] Asynchronous worker terhubung ke ESP32 pada: {p}")
+                        except Exception:
+                            self.ser = None
+                            self.state_str = "DISCONNECTED"
+                            with vision_state.lock:
+                                vision_state.serial_state = "DISCONNECTED"
+                time.sleep(0.05)
+                continue
+
+            with self.lock:
+                msg = self.latest_msg
+
+            try:
+                # Bersihkan input buffer agar buffer serial Linux TTY tidak meluap
+                if self.ser.in_waiting > 0:
+                    self.ser.reset_input_buffer()
+
+                self.ser.write(msg.encode('utf-8'))
+                self.state_str = "TX_OK"
+                with vision_state.lock:
+                    vision_state.serial_state = "TX_OK"
+            except Exception:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                self.state_str = "DISCONNECTED"
+                with vision_state.lock:
+                    vision_state.serial_state = "DISCONNECTED"
+
+            time.sleep(0.03)
+
+    def close(self):
+        self.running = False
+        if self.ser:
+            try:
+                self.ser.write(b"LOST\n")
+                self.ser.close()
+            except Exception:
+                pass
+
 def get_ai_face_detector():
     """
     Memuat model Neural Network OpenCV YuNet (ONNX, ~227KB):
@@ -503,7 +588,10 @@ def configure_camera_hardware(cap, cam_device):
             # 6. Naikkan ketajaman (sharpness)
             subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=sharpness=32"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[CAMERA] Optimasi hardware v4l2 diterapkan pada {cam_device} (Backlight Comp=1, 50Hz, Saturation=64, Contrast=38).")
+            # 7. Kunci frame rate hardware agar tidak anjlok ke 1-2 FPS di ruangan gelap
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=exposure_auto_priority=0"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[CAMERA] Optimasi hardware v4l2 diterapkan pada {cam_device} (Backlight Comp=1, 50Hz, Saturation=64, Contrast=38, FPS Lock).")
         except Exception as e:
             print(f"[CAMERA INFO] v4l2-ctl opsional tidak dapat dijalankan: {e}")
 
@@ -1067,27 +1155,10 @@ def main():
         web_thread.start()
         print(f"[WEB] Server visualisasi aktif di port {args.web_port}")
 
-    # Inisialisasi Serial ke ESP32
-    ser = None
-    serial_state_str = "DRY"
-    if not args.dry_run:
-        port_to_use = args.port or find_serial_port()
-        if port_to_use:
-            try:
-                ser = serial.Serial(port_to_use, 115200, timeout=0.05)
-                time.sleep(2.0)
-                serial_state_str = "TX_OK"
-                print(f"[SERIAL] Sukses terhubung ke ESP32 pada: {port_to_use}")
-            except Exception as e:
-                print(f"[SERIAL WARN] Gagal membuka port {port_to_use}: {e}")
-                print("[SERIAL WARN] Tips: jalankan 'sudo usermod -a -G dialout $USER'")
-        else:
-            print("[SERIAL INFO] ESP32 tidak ditemukan. Berjalan dalam mode DRY-RUN.")
-    else:
-        print("[SERIAL INFO] Mode simulasi DRY-RUN aktif.")
-
-    vision_state.serial_state = serial_state_str
-    vision_state.serial_port = port_to_use if (ser and not args.dry_run) else "DRY_RUN"
+    # Inisialisasi Serial Asinkronus ke ESP32 (Non-blocking background thread)
+    serial_sender = AsyncSerialSender(port=args.port, baud=115200, dry_run=args.dry_run)
+    vision_state.serial_state = serial_sender.state_str
+    vision_state.serial_port = args.port or ("AUTO" if not args.dry_run else "DRY_RUN")
     vision_state.mode = args.mode
 
     # Inisialisasi Kamera UVC
@@ -1628,35 +1699,14 @@ def main():
             cv2.rectangle(annotated_frame, (CENTER_X - 12, CENTER_Y - 12), (CENTER_X + 12, CENTER_Y + 12),
                           (100, 100, 100), 1)
 
-            # Transmisi Serial ke ESP32 (~30 FPS)
+            # Transmisi Serial Asinkronus ke ESP32 (0.00 ms, tidak pernah memblokir FPS)
             now_time = time.time()
-            if ser and (now_time - last_serial_send > 0.03):
-                try:
-                    if has_target:
-                        dist_cm = int(smooth_distance * 100)
-                        msg = f"X:{err_x},Y:{err_y},D:{dist_cm}\n"
-                    else:
-                        msg = "LOST\n"
-                    ser.write(msg.encode('utf-8'))
-                    last_serial_send = now_time
-                except Exception as e:
-                    print(f"[SERIAL ERROR] Komunikasi terputus: {e}")
-                    ser = None
-                    serial_state_str = "DISCONNECTED"
-                    vision_state.serial_state = "DISCONNECTED"
-            elif ser is None and not args.dry_run and (now_time - last_serial_reconnect > 2.0):
-                # Percobaan Auto-Reconnect berkala jika kabel ESP32 dicabut-pasang
-                last_serial_reconnect = now_time
-                reconnect_port = args.port or find_serial_port()
-                if reconnect_port:
-                    try:
-                        ser = serial.Serial(reconnect_port, 115200, timeout=0.05)
-                        serial_state_str = "TX_OK"
-                        vision_state.serial_state = "TX_OK"
-                        vision_state.serial_port = reconnect_port
-                        print(f"[SERIAL] Auto-reconnect berhasil ke ESP32 pada: {reconnect_port}")
-                    except Exception:
-                        ser = None
+            if has_target:
+                dist_cm = int(smooth_distance * 100)
+                serial_sender.send(f"X:{err_x},Y:{err_y},D:{dist_cm}\n")
+            else:
+                serial_sender.send("LOST\n")
+            serial_state_str = serial_sender.state_str
 
             # Hitung FPS
             fps = 1.0 / (now_time - prev_time + 1e-6)
@@ -1768,12 +1818,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[STOP] Program dihentikan pengguna.")
     finally:
-        if ser:
-            try:
-                ser.write(b"LOST\n")
-                ser.close()
-            except Exception:
-                pass
+        if serial_sender:
+            serial_sender.close()
         cap.release()
         if not is_headless:
             cv2.destroyAllWindows()

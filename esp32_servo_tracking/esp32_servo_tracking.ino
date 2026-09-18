@@ -116,58 +116,68 @@ void setup() {
   Serial.println("--------------------------------------------------\n");
 }
 
-void loop() {
-  // 1. BACA PAKET SERIAL NON-BLOCKING DARI STB/PC
-  while (Serial.available() > 0) {
-    String packet = Serial.readStringUntil('\n');
-    packet.trim();
+char rxBuffer[64];
+int rxIndex = 0;
 
-    if (packet.length() == 0) continue;
+void processPacket(char* pkt) {
+  if (strcmp(pkt, "LOST") == 0) {
+    targetLocked = false;
+    targetErrX = 0;
+    targetErrY = 0;
+    cameraDistCm = 0;
+    return;
+  }
 
-    if (packet == "LOST") {
-      targetLocked = false;
-      targetErrX = 0;
-      targetErrY = 0;
-      cameraDistCm = 0;
-    } 
-    else if (packet.startsWith("X:")) {
-      int idxX = packet.indexOf("X:");
-      int idxY = packet.indexOf(",Y:");
-      int idxD = packet.indexOf(",D:");
-
-      if (idxY != -1) {
-        if (idxD != -1) {
-          // Format lengkap: "X:<x>,Y:<y>,D:<dist>"
-          targetErrX = packet.substring(idxX + 2, idxY).toInt();
-          targetErrY = packet.substring(idxY + 3, idxD).toInt();
-          cameraDistCm = packet.substring(idxD + 3).toInt();
-        } else {
-          // Format tanpa jarak: "X:<x>,Y:<y>"
-          targetErrX = packet.substring(idxX + 2, idxY).toInt();
-          targetErrY = packet.substring(idxY + 3).toInt();
-          cameraDistCm = 0;
-        }
-
-        targetLocked = true;
-        lastPacketTime = millis();
-
-        // 2. KENDALI PROPORSIONAL SERVO PAN-TILT
-        // Pan: Jika target di kanan (ErrX > 0), putar servo ke kanan
-        if (abs(targetErrX) > DEADZONE_PX) {
-          float deltaPan = - (targetErrX * KP_PAN);
-          currentPan += deltaPan;
-          currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
-          servoPan.write((int)currentPan);
-        }
-
-        // Tilt: Jika target di bawah (ErrY > 0), tundukkan kamera
-        if (abs(targetErrY) > DEADZONE_PX) {
-          float deltaTilt = (targetErrY * KP_TILT);
-          currentTilt += deltaTilt;
-          currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
-          servoTilt.write((int)currentTilt);
-        }
+  if (pkt[0] == 'X' && pkt[1] == ':') {
+    char* idxY = strstr(pkt, ",Y:");
+    char* idxD = strstr(pkt, ",D:");
+    if (idxY != NULL) {
+      *idxY = '\0';
+      targetErrX = atoi(pkt + 2);
+      if (idxD != NULL) {
+        *idxD = '\0';
+        targetErrY = atoi(idxY + 3);
+        cameraDistCm = atoi(idxD + 3);
+      } else {
+        targetErrY = atoi(idxY + 3);
+        cameraDistCm = 0;
       }
+
+      targetLocked = true;
+      lastPacketTime = millis();
+
+      // 2. KENDALI PROPORSIONAL SERVO PAN-TILT
+      // Pan: Jika target di kanan (ErrX > 0), putar servo ke kanan
+      if (abs(targetErrX) > DEADZONE_PX) {
+        float deltaPan = - (targetErrX * KP_PAN);
+        currentPan += deltaPan;
+        currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
+        servoPan.write((int)currentPan);
+      }
+
+      // Tilt: Jika target di bawah (ErrY > 0), tundukkan kamera
+      if (abs(targetErrY) > DEADZONE_PX) {
+        float deltaTilt = (targetErrY * KP_TILT);
+        currentTilt += deltaTilt;
+        currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
+        servoTilt.write((int)currentTilt);
+      }
+    }
+  }
+}
+
+void loop() {
+  // 1. BACA PAKET SERIAL 100% NON-BLOCKING (Zero-Timeout)
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (rxIndex > 0) {
+        rxBuffer[rxIndex] = '\0';
+        processPacket(rxBuffer);
+        rxIndex = 0;
+      }
+    } else if (rxIndex < (int)sizeof(rxBuffer) - 1) {
+      rxBuffer[rxIndex++] = c;
     }
   }
 
@@ -220,52 +230,12 @@ void loop() {
     currentAction = ACT_MAJU_MENGEJAR;
   }
 
-  // 7. TELEMETRI MONITOR BENCH TEST (Cetak tiap 250ms)
-  if (millis() - lastTelemetryPrint > 250) {
+  // 7. TELEMETRI MONITOR BENCH TEST (Hanya aktif untuk debugging serial monitor)
+  // Dinonaktifkan saat live dengan STB agar buffer UART tetap bersih dan 0 latency
+  #if 0
+  if (millis() - lastTelemetryPrint > 1000) {
     lastTelemetryPrint = millis();
-
-    Serial.print("[STATUS: ");
-    if (targetLocked) Serial.print("TERKUNCI ");
-    else Serial.print("MENCARI  ");
-    Serial.print("] ");
-
-    Serial.print("Pan:");
-    if (currentPan < 100) Serial.print(" ");
-    Serial.print((int)currentPan);
-    Serial.print("° Tilt:");
-    Serial.print((int)currentTilt);
-    Serial.print("° | ");
-
-    Serial.print("Jarak: ");
-    if (effectiveDistance > 0) {
-      Serial.print(effectiveDistance);
-      Serial.print(" cm (");
-      Serial.print(distSource);
-      Serial.print(") | ");
-    } else {
-      Serial.print("-- cm | ");
-    }
-
-    Serial.print("Aksi: ");
-    switch (currentAction) {
-      case ACT_EMERGENCY_STOP:
-        Serial.println("🛑 [EMERGENCY CUTOFF] (<30cm!)");
-        break;
-      case ACT_STOP_ZONE_TENANG:
-        Serial.println("🟢 [ZONA TENANG - STOP] (70-90cm)");
-        break;
-      case ACT_MAJU_MENGEJAR:
-        Serial.println("⬆️  [MAJU MENGEJAR] (>100cm)");
-        break;
-      case ACT_MUNDUR_MENJAUH:
-        Serial.println("⬇️  [MUNDUR MENJAUH] (35-60cm)");
-        break;
-      case ACT_SEARCHING:
-      default:
-        Serial.println("⚪ [STANDBY / TARGET LOST]");
-        break;
-    }
+    Serial.printf("[ESP32] Pan:%d Tilt:%d Jarak:%d\n", (int)currentPan, (int)currentTilt, effectiveDistance);
   }
-
-  delay(5);
+  #endif
 }
