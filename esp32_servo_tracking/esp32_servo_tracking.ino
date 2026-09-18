@@ -44,10 +44,12 @@ const float TILT_MIN = 50.0;
 const float TILT_MAX = 130.0;
 const float TILT_MID = 90.0;
 
-// Parameter Kendali Servo
-const int DEADZONE_PX   = 12;    // Zona toleransi anti-jitter (piksel)
-const float KP_PAN      = 0.04;  // Kecepatan respon belok Pan
-const float KP_TILT     = 0.03;  // Kecepatan respon Tilt
+// Parameter Kendali Servo Proporsional & Anti-Sentak (Smooth Slew-Rate Limiter)
+const int DEADZONE_PX       = 18;    // Zona toleransi anti-jitter (piksel)
+const float KP_PAN          = 0.020; // Kecepatan belok Pan (dihaluskan dari 0.04)
+const float KP_TILT         = 0.015; // Kecepatan Tilt (dihaluskan dari 0.03)
+const float MAX_STEP_PAN    = 1.5;   // Maksimal perubahan sudut Pan per packet (derajat) - Anti-Reog!
+const float MAX_STEP_TILT   = 1.0;   // Maksimal perubahan sudut Tilt per packet
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
 // Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)
@@ -150,11 +152,13 @@ void processPacket(char* pkt) {
       targetLocked = true;
       lastPacketTime = millis();
 
-      // 2. KENDALI PROPORSIONAL SERVO PAN-TILT
+      // 2. KENDALI PROPORSIONAL SERVO PAN-TILT DENGAN SLEW-RATE LIMITER (ANTI-SENTAK)
       // Pan: Belokkan servo menuju posisi target horizontal
       if (abs(targetErrX) > DEADZONE_PX) {
         float dirPan = INVERT_PAN ? 1.0 : -1.0;
         float deltaPan = dirPan * (targetErrX * KP_PAN);
+        // Batasi percepatan putar servo per frame agar gerakan halus dan tidak bergetar (anti-reog)
+        deltaPan = constrain(deltaPan, -MAX_STEP_PAN, MAX_STEP_PAN);
         currentPan += deltaPan;
         currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
         servoPan.write((int)currentPan);
@@ -164,6 +168,7 @@ void processPacket(char* pkt) {
       if (abs(targetErrY) > DEADZONE_PX) {
         float dirTilt = INVERT_TILT ? -1.0 : 1.0;
         float deltaTilt = dirTilt * (targetErrY * KP_TILT);
+        deltaTilt = constrain(deltaTilt, -MAX_STEP_TILT, MAX_STEP_TILT);
         currentTilt += deltaTilt;
         currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
         servoTilt.write((int)currentTilt);

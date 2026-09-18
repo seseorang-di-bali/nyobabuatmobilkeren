@@ -682,6 +682,57 @@ class ThreadedCamera:
         self.cap.release()
 
 
+class AdaptiveServoTuner:
+    """
+    Sistem Kalibrasi Mandiri (Self-Tuning / Auto-Calibration):
+    Mendeteksi osilasi / overshooting (ketika servo bergerak terlalu cepat dan bolak-balik melintasi target).
+    Secara cerdas meredam gain kecepatan dan meningkatkan smoothing hingga respon servo pas dan sinematik.
+    """
+    def __init__(self):
+        self.last_sign = 0
+        self.sign_flip_times = []
+        self.last_adjustment = time.time()
+        self.status = "MENUNGGU TARGET"
+
+    def update(self, err_x, current_speed_pct, current_smooth_pct, is_auto_tune_enabled):
+        if not is_auto_tune_enabled or abs(err_x) < 8:
+            return current_speed_pct, current_smooth_pct, self.status
+
+        now = time.time()
+        curr_sign = 1 if err_x > 0 else (-1 if err_x < 0 else 0)
+
+        # Deteksi pembalikan tanda arah (+ ke - atau - ke +) -> indikasi overshooting
+        if self.last_sign != 0 and curr_sign != 0 and curr_sign != self.last_sign:
+            self.sign_flip_times.append(now)
+            # Simpan hanya kejadian dalam 1.2 detik terakhir
+            self.sign_flip_times = [t for t in self.sign_flip_times if now - t < 1.2]
+
+            # Jika terjadi >= 2 kali pembalikan dalam 1.2 detik (Overshoot / Goyang Bolak-balik):
+            if len(self.sign_flip_times) >= 2 and (now - self.last_adjustment > 0.35):
+                # Terlalu cepat / terlalu banyak gerak! Redam kecepatan dan tingkatkan kelembutan
+                new_speed = max(15, current_speed_pct - 6)
+                new_smooth = min(85, current_smooth_pct + 4)
+                self.last_adjustment = now
+                self.sign_flip_times.clear()
+                self.status = f"AUTO-DAMPING ({new_speed}%)"
+                return new_speed, new_smooth, self.status
+
+        self.last_sign = curr_sign
+
+        # Jika stabil (tanpa osilasi) selama > 4.0 detik:
+        if now - self.last_adjustment > 4.0:
+            if abs(err_x) > 35 and current_speed_pct < 55:
+                # Sedikit lambat mengejar, naikkan perlahan
+                new_speed = min(65, current_speed_pct + 2)
+                self.last_adjustment = now
+                self.status = f"OPTIMAL ({new_speed}%)"
+                return new_speed, current_smooth_pct, self.status
+            else:
+                self.status = f"PAS & STABIL ({current_speed_pct}%)"
+
+        return current_speed_pct, current_smooth_pct, self.status
+
+
 class VisionState:
     """State thread-safe untuk berbagi data antara visual tracker dan Web HUD."""
     def __init__(self):
@@ -702,6 +753,11 @@ class VisionState:
         self.flip_v = False      # Flip vertikal (jika kamera terbalik atas-bawah)
         self.invert_pan = False  # Invert arah putaran servo Pan horizontal
         self.invert_tilt = False # Invert arah putaran servo Tilt vertikal
+        self.servo_speed_pct = 40       # Kecepatan respon servo (10% s/d 100%, default 40% halus)
+        self.servo_smoothing_pct = 70   # Kelembutan EMA (10% agresif s/d 90% sinematik)
+        self.servo_deadzone = 16        # Deadzone pixel anti-jitter
+        self.auto_tune = True           # Auto-tune adaptif anti-overshoot aktif
+        self.auto_tune_status = "MENUNGGU TARGET"
         self.target_profile = "torso"  # Default: Badan Atas & Baju
         self.change_profile_req = None
         self.distance_m = 0.0
@@ -862,12 +918,34 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <div class="control-panel">
+            <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PENGATUR KECEPATAN & AUTO-TUNE SERVO:</span>
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center; margin-top: 8px;">
+                <div style="flex: 1; min-width: 180px;">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kecepatan: <span id="val-speed" style="color: var(--accent-color); font-weight: bold;">40%</span></label>
+                    <input type="range" id="slider-speed" min="10" max="100" value="40" style="width: 100%; cursor: pointer;" oninput="changeServoSpeed(this.value)">
+                </div>
+                <div style="flex: 1; min-width: 180px;">
+                    <label style="font-size: 0.8rem; color: var(--text-sub);">Kelembutan (Anti-Sentak): <span id="val-smooth" style="color: var(--success-color); font-weight: bold;">70%</span></label>
+                    <input type="range" id="slider-smooth" min="10" max="90" value="70" style="width: 100%; cursor: pointer;" oninput="changeServoSmooth(this.value)">
+                </div>
+                <div>
+                    <button id="btn-toggle-autotune" class="btn-primary" onclick="toggleAutoTune()">🧠 Auto-Tune: ON</button>
+                </div>
+            </div>
+            <div style="font-size: 0.78rem; color: var(--text-sub); margin-top: 6px;">
+                Status Kalibrasi Mandiri: <span id="val-autotune-status" style="color: var(--accent-color); font-weight: 600;">MENUNGGU TARGET</span>
+            </div>
+        </div>
+
         <footer>
             Autonomous Vision-Guided Robot &bull; Streamed from STB Armbian to Mac Local Browser
         </footer>
     </div>
 
     <script>
+        let isDraggingSlider = false;
+
         function triggerReset() {
             fetch('/api/reset', { method: 'POST' })
                 .then(r => r.json())
@@ -908,6 +986,26 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch('/api/toggle_invert_pan', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => console.log('Invert Pan toggled to: ' + data.invert_pan));
+        }
+
+        function changeServoSpeed(val) {
+            isDraggingSlider = true;
+            document.getElementById('val-speed').innerText = val + '%';
+            fetch('/api/servo_speed?val=' + val, { method: 'POST' })
+                .finally(() => setTimeout(() => { isDraggingSlider = false; }, 800));
+        }
+
+        function changeServoSmooth(val) {
+            isDraggingSlider = true;
+            document.getElementById('val-smooth').innerText = val + '%';
+            fetch('/api/servo_smooth?val=' + val, { method: 'POST' })
+                .finally(() => setTimeout(() => { isDraggingSlider = false; }, 800));
+        }
+
+        function toggleAutoTune() {
+            fetch('/api/toggle_autotune', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => console.log('Auto-tune toggled to:', data.auto_tune));
         }
 
         function updateTelemetry() {
@@ -1026,6 +1124,29 @@ HTML_PAGE = """<!DOCTYPE html>
                         btnWdr.className = data.anti_silau ? 'btn-primary' : 'btn-secondary';
                         btnWdr.innerText = data.anti_silau ? '☀️ Anti-Silau (WDR ON)' : '☀️ Anti-Silau (WDR OFF)';
                     }
+
+                    // Update Kontrol Auto-Tune & Slider Servo
+                    const statusAuto = document.getElementById('val-autotune-status');
+                    if (statusAuto && data.auto_tune_status) {
+                        statusAuto.innerText = data.auto_tune_status;
+                    }
+                    const btnAuto = document.getElementById('btn-toggle-autotune');
+                    if (btnAuto) {
+                        btnAuto.className = data.auto_tune ? 'btn-primary' : 'btn-secondary';
+                        btnAuto.innerText = data.auto_tune ? '🧠 Auto-Tune: ON' : '🧠 Auto-Tune: MANUAL';
+                    }
+                    if (!isDraggingSlider) {
+                        const sSpeed = document.getElementById('slider-speed');
+                        const sSmooth = document.getElementById('slider-smooth');
+                        if (sSpeed && data.servo_speed_pct !== undefined) {
+                            sSpeed.value = data.servo_speed_pct;
+                            document.getElementById('val-speed').innerText = data.servo_speed_pct + '%';
+                        }
+                        if (sSmooth && data.servo_smoothing_pct !== undefined) {
+                            sSmooth.value = data.servo_smoothing_pct;
+                            document.getElementById('val-smooth').innerText = data.servo_smoothing_pct + '%';
+                        }
+                    }
                 })
                 .catch(e => console.error(e));
         }
@@ -1108,6 +1229,10 @@ def create_app():
                 "mirror": bool(vision_state.mirror),
                 "flip_v": bool(vision_state.flip_v),
                 "invert_pan": bool(vision_state.invert_pan),
+                "servo_speed_pct": int(vision_state.servo_speed_pct),
+                "servo_smoothing_pct": int(vision_state.servo_smoothing_pct),
+                "auto_tune": bool(vision_state.auto_tune),
+                "auto_tune_status": str(vision_state.auto_tune_status),
                 "anti_silau": bool(vision_state.anti_silau),
                 "clothes_match_pct": int(vision_state.clothes_match_pct)
             })
@@ -1150,6 +1275,36 @@ def create_app():
             vision_state.invert_pan = not vision_state.invert_pan
             new_val = vision_state.invert_pan
         return jsonify({"status": "ok", "invert_pan": new_val})
+
+    @app.route('/api/servo_speed', methods=['POST', 'GET'])
+    def api_servo_speed():
+        try:
+            val = int(request.args.get('val', 40))
+            val = max(10, min(100, val))
+            with vision_state.lock:
+                vision_state.servo_speed_pct = val
+            return jsonify({"status": "ok", "servo_speed_pct": val})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+
+    @app.route('/api/servo_smooth', methods=['POST', 'GET'])
+    def api_servo_smooth():
+        try:
+            val = int(request.args.get('val', 70))
+            val = max(10, min(90, val))
+            with vision_state.lock:
+                vision_state.servo_smoothing_pct = val
+            return jsonify({"status": "ok", "servo_smoothing_pct": val})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+
+    @app.route('/api/toggle_autotune', methods=['POST', 'GET'])
+    def api_toggle_autotune():
+        with vision_state.lock:
+            vision_state.auto_tune = not vision_state.auto_tune
+            val = vision_state.auto_tune
+            vision_state.auto_tune_status = "AKTIF" if val else "MANUAL"
+        return jsonify({"status": "ok", "auto_tune": val})
 
     @app.route('/api/toggle_anti_silau', methods=['POST', 'GET'])
     def api_toggle_anti_silau():
@@ -1288,6 +1443,9 @@ def main():
     last_face_scan = 0
     frame_counter = 0
     mismatch_streak = 0
+    smooth_err_x = 0.0
+    smooth_err_y = 0.0
+    servo_tuner = AdaptiveServoTuner()
 
     print("[SYSTEM] Pipeline kamera aktif. Memulai pelacakan...\n")
 
@@ -1790,11 +1948,45 @@ def main():
             # Transmisi Serial Asinkronus ke ESP32 (0.00 ms, tidak pernah memblokir FPS)
             now_time = time.time()
             if has_target:
+                # 1. Update Auto-Tuner & Adaptive Calibration (Self-training anti-overshoot)
+                with vision_state.lock:
+                    is_autotune = vision_state.auto_tune
+                    cur_speed = vision_state.servo_speed_pct
+                    cur_smooth = vision_state.servo_smoothing_pct
+                    deadzone = vision_state.servo_deadzone
+
+                if is_autotune:
+                    new_spd, new_sm, tune_status = servo_tuner.update(err_x, cur_speed, cur_smooth, True)
+                    if new_spd != cur_speed or new_sm != cur_smooth or tune_status != vision_state.auto_tune_status:
+                        with vision_state.lock:
+                            vision_state.servo_speed_pct = new_spd
+                            vision_state.servo_smoothing_pct = new_sm
+                            vision_state.auto_tune_status = tune_status
+                        cur_speed, cur_smooth = new_spd, new_sm
+
+                # 2. Filter Exponential Moving Average (EMA) - Mengubah sentakan kasar jadi luncuran halus
+                alpha = max(0.10, min(0.60, 1.0 - (cur_smooth / 100.0) * 0.85))
+                smooth_err_x = alpha * err_x + (1.0 - alpha) * smooth_err_x
+                smooth_err_y = alpha * err_y + (1.0 - alpha) * smooth_err_y
+
+                # 3. Dynamic Deadzone: Mencegah servo bergetar saat target sudah dekat di tengah
+                dead_x = smooth_err_x if abs(smooth_err_x) > deadzone else 0.0
+                dead_y = smooth_err_y if abs(smooth_err_y) > deadzone else 0.0
+
+                # 4. Pengali Kecepatan Respon (cur_speed: 10% - 100% -> scale: 0.15 - 1.0)
+                speed_factor = max(0.15, min(1.0, cur_speed / 100.0))
+                target_send_x = int(dead_x * speed_factor)
+                target_send_y = int(dead_y * speed_factor)
+
                 dist_cm = int(smooth_distance * 100)
-                send_err_x = -err_x if do_invert_pan else err_x
-                send_err_y = -err_y if do_invert_tilt else err_y
+                send_err_x = -target_send_x if do_invert_pan else target_send_x
+                send_err_y = -target_send_y if do_invert_tilt else target_send_y
                 serial_sender.send(f"X:{send_err_x},Y:{send_err_y},D:{dist_cm}\n")
             else:
+                smooth_err_x = 0.0
+                smooth_err_y = 0.0
+                with vision_state.lock:
+                    vision_state.auto_tune_status = "MENUNGGU TARGET"
                 serial_sender.send("LOST\n")
             serial_state_str = serial_sender.state_str
 
