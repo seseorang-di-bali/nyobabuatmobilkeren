@@ -499,7 +499,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
     best_box = None
     best_score = 0.0
 
-    def calculate_effective_score(cand_b, raw_s):
+    def calculate_effective_score(cand_b, raw_s, is_face=False):
         eff_s = raw_s
         if last_target_box is not None:
             lx = last_target_box[0] + last_target_box[2] // 2
@@ -516,9 +516,12 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             if mot > 2.0:
                 # Memiliki pergerakan intrinsik (manusia aktif): beri dorongan prioritas +15%
                 eff_s = min(1.0, eff_s * 1.15)
+            elif mot < 1.0 and not is_face:
+                # Benda mati total / tidak ada gerakan & bukan wajah AI: kurangi drastis (-50%)
+                # Mencegah mengunci kain gantung/kursi/bantal yang warnanya kebetulan mirip
+                eff_s = eff_s * 0.50
             elif mot < 0.8:
-                # Benda mati total / tidak ada gerakan: kurangi prioritas -18%
-                eff_s = eff_s * 0.82
+                eff_s = eff_s * 0.85
         return eff_s
 
     # 1. Prioritas Utama: YuNet AI Neural Network Detector (~5-9 ms)
@@ -531,7 +534,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                     cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
                     test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
                     s = compare_clothes_color(frame, test_b, target_hist)
-                    eff_s = calculate_effective_score(test_b, s)
+                    eff_s = calculate_effective_score(test_b, s, is_face=True)
                     if eff_s > best_score:
                         best_score = eff_s
                         best_box = test_b
@@ -552,7 +555,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                         cbx = max(0, min(FRAME_WIDTH - cand_box[2], cand_box[0] + dx))
                         test_b = (cbx, cand_box[1], cand_box[2], cand_box[3])
                         s = compare_clothes_color(frame, test_b, target_hist)
-                        eff_s = calculate_effective_score(test_b, s)
+                        eff_s = calculate_effective_score(test_b, s, is_face=True)
                         if eff_s > best_score:
                             best_score = eff_s
                             best_box = test_b
@@ -579,7 +582,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                     by = max(0, min(FRAME_HEIGHT - cand_h, cy))
                     test_b = (bx, by, cand_w, cand_h)
                     s = compare_clothes_color(frame, test_b, target_hist)
-                    eff_s = calculate_effective_score(test_b, s)
+                    eff_s = calculate_effective_score(test_b, s, is_face=False)
                     if eff_s > best_score:
                         best_score = eff_s
                         best_box = test_b
@@ -605,7 +608,7 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
                     by = max(0, min(FRAME_HEIGHT - ch, cy - int(ch * 0.35)))
                     cand_box = (bx, by, cw, ch)
                     score = compare_clothes_color(frame, cand_box, target_hist)
-                    eff_s = calculate_effective_score(cand_box, score)
+                    eff_s = calculate_effective_score(cand_box, score, is_face=False)
                     if eff_s > best_score:
                         best_score = eff_s
                         best_box = cand_box
@@ -1936,8 +1939,11 @@ def main():
                                     if c_roi.size > 0:
                                         c_gray = cv2.cvtColor(c_roi, cv2.COLOR_BGR2GRAY)
                                         c_std = float(np.std(c_gray))
-                                        # Pakaian dan badan manusia memiliki variansi tekstur yang nyata (> 18.0)
-                                        if c_std > 18.0:
+                                        c_mot = compute_box_motion(frame_diff, center_box) if frame_diff is not None else 0.0
+                                        # Pakaian dan badan manusia memiliki variansi tekstur nyata (> 18.0)
+                                        # DAN wajib memiliki denyut gerakan dinamis (> 2.0).
+                                        # Benda mati (gantungan baju, kursi, gorden, kasur) memiliki mot < 0.8 sehingga dilarang memicu auto-lock!
+                                        if c_std > 18.0 and c_mot > 2.0:
                                             active_lock_box = center_box
                                             human_last_seen = now
                                             found_human = True
@@ -2112,6 +2118,22 @@ def main():
                                 scanning_owner_start = now
                                 status_text = "SCANNING_OWNER"
                                 status_color = (0, 165, 255)
+                            elif static_streak >= 45 and not ai_reanchored:
+                                # Target membisu total tanpa denyut gerak dan tanpa wajah selama ~2 detik.
+                                # Manusia hidup selalu memiliki mikrogelombang gerak (napas, geser bahu) atau wajah.
+                                # Jika benar-benar membisu (mot < 1.3), ini 100% benda mati (kain gantung, kursi, bantal)!
+                                print(f"[ANTI-BENDA-MATI] Target diam membisu tanpa wajah/gerak (mot={box_motion:.1f}, streak={static_streak}). Melepas kuncian benda mati!")
+                                tracking_active = False
+                                target_box = None
+                                target_clothes_hist = None  # Reset template palsu agar tidak mengunci kain gantung lagi
+                                static_streak = 0
+                                mismatch_streak = 0
+                                countdown_start = None
+                                scanning_owner_start = None
+                                with vision_state.lock:
+                                    vision_state.clothes_match_pct = 0
+                                status_text = "MENUNGGU_MAJIKAN"
+                                status_color = (0, 200, 255)
 
                         if target_box is not None:
                             is_valid_match = (match_score >= 0.50) or (ai_reanchored and match_score >= 0.40)
