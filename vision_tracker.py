@@ -470,7 +470,11 @@ def update_clothes_color_signature(target_sig, curr_sig, alpha=0.96):
         return target_sig
 
 def compute_box_motion(frame_diff, box):
-    """Menghitung intensitas pergerakan piksel di dalam kotak target (0.01 ms)."""
+    """
+    Menghitung intensitas pergerakan piksel di dalam kotak target (0.01 ms):
+    Memfilter noise sensor kamera (grain < 12 DN) agar benda mati tidak dianggap bergerak.
+    Mengembalikan persentase piksel yang benar-benar mengalami pergeseran (0.0% - 100.0%).
+    """
     if frame_diff is None or box is None:
         return 0.0
     try:
@@ -480,7 +484,11 @@ def compute_box_motion(frame_diff, box):
         w = max(2, min(FRAME_WIDTH - x, w))
         h = max(2, min(FRAME_HEIGHT - y, h))
         roi = frame_diff[y:y+h, x:x+w]
-        return float(np.mean(roi)) if roi.size > 0 else 0.0
+        if roi.size == 0:
+            return 0.0
+        # Piksel diff > 12 adalah pergerakan fisik nyata (kebal grain/noise sensor webcam)
+        moving = roi[roi > 12]
+        return float((moving.size / roi.size) * 100.0)
     except Exception:
         return 0.0
 
@@ -542,11 +550,11 @@ def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, yunet_detec
             if best_score >= 0.50:
                 return best_box, best_score
 
-    # 2. Prioritas Kedua: Haar Cascade Fallback
-    if face_cascade and not face_cascade.empty():
+    # 2. Prioritas Kedua: Haar Cascade Fallback (HANYA jika YuNet AI tidak tersedia)
+    if not yunet_detector and face_cascade and not face_cascade.empty():
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
             if len(faces) > 0:
                 faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
                 for (fx, fy, fw, fh) in faces[:2]:
@@ -1816,11 +1824,11 @@ def main():
                         clicked_box = p_box
                         break
 
-                # 2. Fallback Haar cascade
-                if clicked_box is None and face_cascade:
+                # 2. Fallback Haar cascade (hanya jika YuNet AI tidak tersedia)
+                if not yunet_detector and clicked_box is None and face_cascade:
                     try:
                         gray_c = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        faces_c = face_cascade.detectMultiScale(gray_c, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                        faces_c = face_cascade.detectMultiScale(gray_c, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
                         for (fx, fy, fw, fh) in faces_c:
                             p_box = derive_body_box_from_face(fx, fy, fw, fh, current_profile)
                             bx, by, bw, bh = p_box
@@ -1917,10 +1925,11 @@ def main():
                                     human_last_seen = now
                                     found_human = True
 
-                            if not found_human and face_cascade:
+                            # Fallback Haar Cascade (HANYA jika YuNet AI tidak tersedia)
+                            if not found_human and not yunet_detector and face_cascade:
                                 try:
                                     gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                    faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                                    faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
                                     if len(faces_found) > 0:
                                         faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
                                         fx, fy, fw, fh = faces_found[0]
@@ -2085,7 +2094,7 @@ def main():
                         # Memeriksa intensitas gerakan target. Jika target mati/diam (misal dinding/kursi),
                         # otomatis cari apakah ada majikan yang bergerak di frame untuk dialihkan kunciannya.
                         box_motion = compute_box_motion(frame_diff, target_box) if frame_diff is not None else 2.0
-                        if box_motion < 1.3 and abs(smooth_err_x) < 22:
+                        if box_motion < 1.0 and abs(smooth_err_x) < 22:
                             static_streak += 1
                         else:
                             static_streak = max(0, static_streak - 2)
@@ -2100,7 +2109,7 @@ def main():
                             if cand_box and cand_score >= 0.50:
                                 cand_mot = compute_box_motion(frame_diff, cand_box) if frame_diff is not None else 0.0
                                 if cand_mot > 1.8 or cand_score > match_score + 0.08:
-                                    print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}), beralih ke majikan bergerak di {cand_box} ({int(cand_score*100)}%, mot={cand_mot:.1f})!")
+                                    print(f"[ANTI-BENDA-MATI] Target diam (mot={box_motion:.1f}%), beralih ke majikan bergerak di {cand_box} ({int(cand_score*100)}%, mot={cand_mot:.1f}%)!")
                                     tracker = create_tracker(current_mode)
                                     if tracker:
                                         tracker.init(frame, cand_box)
@@ -2111,18 +2120,18 @@ def main():
                                         clothes_pct = int(match_score * 100)
                             elif static_streak >= 25 and match_score < 0.50:
                                 # Sudah diam >= 25 frame dan skor baju rendah (<50%) -> lepas kuncian benda mati
-                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}, match={clothes_pct}% < 50%). Melepas kuncian!")
+                                print(f"[ANTI-BENDA-MATI] Target terkonfirmasi benda mati tak bergerak (mot={box_motion:.1f}%, match={clothes_pct}% < 50%). Melepas kuncian!")
                                 tracking_active = False
                                 target_box = None
                                 static_streak = 0
                                 scanning_owner_start = now
                                 status_text = "SCANNING_OWNER"
                                 status_color = (0, 165, 255)
-                            elif static_streak >= 45 and not ai_reanchored:
-                                # Target membisu total tanpa denyut gerak dan tanpa wajah selama ~2 detik.
+                            elif static_streak >= 30 and not ai_reanchored:
+                                # Target membisu total tanpa denyut gerak dan tanpa wajah selama ~1 detik (30 frame).
                                 # Manusia hidup selalu memiliki mikrogelombang gerak (napas, geser bahu) atau wajah.
-                                # Jika benar-benar membisu (mot < 1.3), ini 100% benda mati (kain gantung, kursi, bantal)!
-                                print(f"[ANTI-BENDA-MATI] Target diam membisu tanpa wajah/gerak (mot={box_motion:.1f}, streak={static_streak}). Melepas kuncian benda mati!")
+                                # Jika benar-benar membisu (mot < 1.0%), ini 100% benda mati (kain gantung, rak, kursi)!
+                                print(f"[ANTI-BENDA-MATI] Target diam membisu tanpa wajah/gerak (mot={box_motion:.1f}%, streak={static_streak}). Melepas kuncian benda mati!")
                                 tracking_active = False
                                 target_box = None
                                 target_clothes_hist = None  # Reset template palsu agar tidak mengunci kain gantung lagi
@@ -2211,9 +2220,9 @@ def main():
                     target_box = (fx, fy, fw, fh)
                     status_text = "AI_FACE_DETECTED"
                     status_color = (0, 255, 0)
-                elif face_cascade and not face_cascade.empty():
+                elif not yunet_detector and face_cascade and not face_cascade.empty():
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=4, minSize=(22, 22))
+                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
                     if len(faces) > 0:
                         faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
                         target_box = faces[0]
@@ -2253,14 +2262,14 @@ def main():
                                 face_calibrated = True
                                 break
 
-                    if not face_calibrated and face_cascade and (frame_counter % 8 == 0):
+                    if not face_calibrated and not yunet_detector and face_cascade and (frame_counter % 8 == 0):
                         roi_y1 = max(0, ty - int(th * 0.45))
                         roi_y2 = min(FRAME_HEIGHT, ty + int(th * 0.35))
                         roi_x1 = max(0, tx - 10)
                         roi_x2 = min(FRAME_WIDTH, tx + tw + 10)
                         if (roi_y2 - roi_y1 >= 25) and (roi_x2 - roi_x1 >= 25):
                             roi_gray = cv2.cvtColor(frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY)
-                            sub_faces = face_cascade.detectMultiScale(roi_gray, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                            sub_faces = face_cascade.detectMultiScale(roi_gray, scaleFactor=1.2, minNeighbors=6, minSize=(25, 25))
                             if len(sub_faces) > 0:
                                 sub_faces = sorted(sub_faces, key=lambda b: b[2] * b[3], reverse=True)
                                 _, _, _, sfh = sub_faces[0]
