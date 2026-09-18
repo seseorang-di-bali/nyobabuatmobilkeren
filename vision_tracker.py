@@ -173,8 +173,9 @@ def get_clothes_color_signature(frame, box):
         y = max(0, min(frame.shape[0] - 1, y))
         w = max(4, min(frame.shape[1] - x, w))
         h = max(4, min(frame.shape[0] - y, h))
-        # Ambil area pakaian (tengah vertikal 20% s.d. 85%, tengah horizontal 15% s.d. 85%)
-        roi = frame[y + int(h*0.20):y + int(h*0.85), x + int(w*0.15):x + int(w*0.85)]
+        # Ambil area pakaian utama (tengah vertikal 15% s.d. 85%, tengah horizontal 20% s.d. 80%)
+        # Menghindari leher atas dan pinggiran background di sisi kiri/kanan
+        roi = frame[y + int(h*0.15):y + int(h*0.85), x + int(w*0.20):x + int(w*0.80)]
         if roi.size == 0:
             return None
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -202,12 +203,15 @@ def compare_clothes_color(frame, box, target_hist):
     except Exception:
         return 0.5
 
-def find_target_in_frame(frame, target_hist, box_w, box_h, face_cascade=None):
+def find_target_in_frame(frame, target_hist, base_box_w, base_box_h, face_cascade=None, profile_type="torso"):
     """
-    Sistem Persistent Re-Identification (Re-ID) & Auto-Snap:
-    Mencari kembali pemilik target di seluruh frame menggunakan signature warna baju yang tersimpan.
-    Jika target ditemukan dengan skor kecocokan tinggi (>= 48%), langsung mengembalikan kotak koordinatnya
-    sehingga sistem bisa langsung 'memaksa mengotaki' pemilik tanpa harus hitung mundur ulang.
+    Sistem Persistent Re-Identification (Re-ID) & Multi-Scale Auto-Snap:
+    Mencari kembali pemilik target di seluruh frame secara adaptif:
+    1. Jika wajah terdeteksi:
+       - Skala kotak badan disesuaikan langsung dengan ukuran wajah (jarak jauh = kotak mengecil otomatis).
+       - Kotak diposisikan tepat di dada/baju (bukan di dahi/rambut), terpusat di tengah badan.
+    2. Jika wajah tidak tampak (membelakangi kamera / tampak punggung):
+       - Memindai multi-skala (jauh, sedang, dekat) agar tetap dapat mengunci target meskipun menjauh.
     """
     if target_hist is None:
         return None, 0.0
@@ -215,42 +219,63 @@ def find_target_in_frame(frame, target_hist, box_w, box_h, face_cascade=None):
     best_box = None
     best_score = 0.0
 
-    # 1. Prioritas Pertama: Cek area tubuh di bawah wajah (jika wajah terdeteksi)
+    # 1. Prioritas Pertama: Pencarian presisi berbasis deteksi wajah (Face-Guided Body Scaling)
     if face_cascade and not face_cascade.empty():
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(25, 25))
-            for (fx, fy, fw, fh) in faces:
-                fcx = fx + fw // 2
-                bx = max(0, min(FRAME_WIDTH - box_w, fcx - box_w // 2))
-                by = max(0, min(FRAME_HEIGHT - box_h, fy - 10))
-                cand_box = (bx, by, box_w, box_h)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+            if len(faces) > 0:
+                faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
+                for (fx, fy, fw, fh) in faces[:3]:
+                    fcx = fx + fw // 2
+                    if profile_type == "torso":
+                        cw = max(38, min(FRAME_WIDTH, int(fw * 2.4)))
+                        ch = max(48, min(FRAME_HEIGHT, int(fh * 3.2)))
+                        top_y = fy + int(fh * 0.72)
+                    elif profile_type == "body":
+                        cw = max(45, min(FRAME_WIDTH, int(fw * 2.7)))
+                        ch = max(75, min(FRAME_HEIGHT, int(fh * 6.5)))
+                        top_y = max(0, fy - int(fh * 0.15))
+                    else:  # face
+                        cw, ch = int(fw * 1.2), int(fh * 1.3)
+                        top_y = max(0, fy - int(fh * 0.1))
+
+                    # Cek titik tengah dan sedikit offset kiri-kanan untuk menemukan pusat baju yang sempurna
+                    for dx in [-10, 0, 10]:
+                        cand_x = max(0, min(FRAME_WIDTH - cw, fcx - cw // 2 + dx))
+                        cand_y = max(0, min(FRAME_HEIGHT - ch, top_y))
+                        cand_box = (cand_x, cand_y, cw, ch)
+                        score = compare_clothes_color(frame, cand_box, target_hist)
+                        if score > best_score:
+                            best_score = score
+                            best_box = cand_box
+
+                if best_score >= 0.48:
+                    return best_box, best_score
+        except Exception:
+            pass
+
+    # 2. Prioritas Kedua: Multi-Scale Grid Scan (untuk tampak belakang / orang membelakangi kamera)
+    # Memindai 3 skala jarak: 0.65x (jauh ~2.5-3.5m), 0.85x (sedang ~1.8-2.5m), 1.1x (dekat ~1.2m)
+    scales = [0.65, 0.85, 1.10]
+    for s in scales:
+        cw = max(36, min(FRAME_WIDTH - 10, int(base_box_w * s)))
+        ch = max(48, min(FRAME_HEIGHT - 10, int(base_box_h * s)))
+        step_x = max(16, int(cw * 0.22))
+        y_center = max(0, min(FRAME_HEIGHT - ch, (FRAME_HEIGHT - ch) // 2))
+        y_cands = [y_center]
+        if y_center - 20 >= 0:
+            y_cands.append(y_center - 20)
+        if y_center + 20 <= FRAME_HEIGHT - ch:
+            y_cands.append(y_center + 20)
+
+        for x_cand in range(0, max(1, FRAME_WIDTH - cw + 1), step_x):
+            for y_cand in y_cands:
+                cand_box = (x_cand, y_cand, cw, ch)
                 score = compare_clothes_color(frame, cand_box, target_hist)
                 if score > best_score:
                     best_score = score
                     best_box = cand_box
-        except Exception:
-            pass
-
-    if best_score >= 0.50:
-        return best_box, best_score
-
-    # 2. Prioritas Kedua: Grid Scan cepat (untuk tampak belakang / orang membelakangi kamera)
-    y_center = max(0, min(FRAME_HEIGHT - box_h, (FRAME_HEIGHT - box_h) // 2))
-    y_candidates = [y_center]
-    if y_center - 25 >= 0:
-        y_candidates.append(y_center - 25)
-    if y_center + 25 <= FRAME_HEIGHT - box_h:
-        y_candidates.append(y_center + 25)
-
-    # Pindai secara horizontal dengan step 25 piksel
-    for x_cand in range(0, max(1, FRAME_WIDTH - box_w + 1), 25):
-        for y_cand in y_candidates:
-            cand_box = (x_cand, y_cand, box_w, box_h)
-            score = compare_clothes_color(frame, cand_box, target_hist)
-            if score > best_score:
-                best_score = score
-                best_box = cand_box
 
     if best_score >= 0.48:
         return best_box, best_score
@@ -963,9 +988,9 @@ def main():
 
                 if not tracking_active:
                     # KASUS A: SUDAH ADA MEMORI WARNA/BENTUK PEMILIK (Persistent Re-ID)
-                    # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame!
+                    # Jangan dipaksa hitung mundur/ngulang, langsung cari pemilik di frame secara multi-skala!
                     if target_clothes_hist is not None:
-                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
                         if re_box and re_score >= 0.48:
                             tracker = create_tracker(current_mode)
                             if tracker:
@@ -993,20 +1018,30 @@ def main():
                         remaining = countdown_duration - elapsed
                         center_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
 
-                        # Smart Auto-Snap jika ada wajah pengguna
-                        if face_cascade and (now - last_face_scan > 0.15):
+                        # Smart Auto-Snap jika ada wajah pengguna (Posisikan tepat di dada/baju, bukan di dahi)
+                        if face_cascade and (now - last_face_scan > 0.12):
                             last_face_scan = now
                             gray_snap = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                            faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=4, minSize=(30, 30))
+                            faces_found = face_cascade.detectMultiScale(gray_snap, scaleFactor=1.2, minNeighbors=4, minSize=(22, 22))
                             if len(faces_found) > 0:
                                 faces_found = sorted(faces_found, key=lambda b: b[2] * b[3], reverse=True)
                                 fx, fy, fw, fh = faces_found[0]
                                 fcx = fx + fw // 2
-                                top_y = max(0, fy - 14)
-                                left_x = max(0, min(FRAME_WIDTH - box_w, fcx - box_w // 2))
-                                if top_y + box_h > FRAME_HEIGHT:
-                                    top_y = max(0, FRAME_HEIGHT - box_h)
-                                active_lock_box = (left_x, top_y, box_w, box_h)
+                                if current_profile == "torso":
+                                    tw = max(38, min(FRAME_WIDTH, int(fw * 2.4)))
+                                    th = max(48, min(FRAME_HEIGHT, int(fh * 3.2)))
+                                    top_y = fy + int(fh * 0.72)
+                                elif current_profile == "body":
+                                    tw = max(45, min(FRAME_WIDTH, int(fw * 2.7)))
+                                    th = max(75, min(FRAME_HEIGHT, int(fh * 6.5)))
+                                    top_y = max(0, fy - int(fh * 0.15))
+                                else:
+                                    tw, th = int(fw * 1.2), int(fh * 1.3)
+                                    top_y = max(0, fy - int(fh * 0.1))
+
+                                left_x = max(0, min(FRAME_WIDTH - tw, fcx - tw // 2))
+                                top_y = max(0, min(FRAME_HEIGHT - th, top_y))
+                                active_lock_box = (left_x, top_y, tw, th)
                             else:
                                 active_lock_box = center_box
 
@@ -1039,12 +1074,77 @@ def main():
                     success, box = tracker.update(frame)
                     if success:
                         target_box = [int(v) for v in box]
-                        match_score = compare_clothes_color(frame, target_box, target_clothes_hist)
+                        bx, by, bw, bh = target_box
+
+                        # 1. Anti-Bahu Drift (Centering Refinement):
+                        # Cek offset horizontal [-14, -7, 0, 7, 14] piksel
+                        # Memastikan kotak selalu menempel kuat di tengah dada/baju, bukan tergelincir ke ujung bahu saat ngereog
+                        raw_score = compare_clothes_color(frame, target_box, target_clothes_hist)
+                        offsets = [-14, -7, 7, 14]
+                        best_dx = 0
+                        best_s = raw_score
+                        for dx in offsets:
+                            tx = max(0, min(FRAME_WIDTH - bw, bx + dx))
+                            s = compare_clothes_color(frame, (tx, by, bw, bh), target_clothes_hist)
+                            if s > best_s:
+                                best_s = s
+                                best_dx = dx
+
+                        if best_dx != 0 and (best_s > raw_score + 0.03):
+                            new_x = max(0, min(FRAME_WIDTH - bw, bx + best_dx))
+                            target_box[0] = new_x
+                            bx = new_x
+                            match_score = best_s
+                            if abs(best_dx) >= 10:
+                                tracker.init(frame, tuple(target_box))
+                        else:
+                            match_score = raw_score
+
+                        # 2. Dynamic Scale Adaptation (Menjauh / Mendekat):
+                        # Jika ada deteksi wajah di sekitar target_box, sesuaikan skala kotak secara dinamis
+                        if face_cascade and (frame_counter % 6 == 0):
+                            try:
+                                gray_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                faces_near = face_cascade.detectMultiScale(gray_f, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
+                                for (fx, fy, fw, fh) in faces_near:
+                                    fcx = fx + fw // 2
+                                    if abs(fcx - (bx + bw // 2)) < bw * 0.75:
+                                        if current_profile == "torso":
+                                            ideal_w = int(fw * 2.4)
+                                            ideal_h = int(fh * 3.2)
+                                            top_y = fy + int(fh * 0.72)
+                                        elif current_profile == "body":
+                                            ideal_w = int(fw * 2.7)
+                                            ideal_h = int(fh * 6.5)
+                                            top_y = max(0, fy - int(fh * 0.15))
+                                        else:
+                                            ideal_w, ideal_h = int(fw * 1.2), int(fh * 1.3)
+                                            top_y = max(0, fy - int(fh * 0.1))
+
+                                        if abs(bw - ideal_w) > 12:
+                                            new_w = max(35, min(FRAME_WIDTH, int(0.65 * bw + 0.35 * ideal_w)))
+                                            new_h = max(45, min(FRAME_HEIGHT, int(0.65 * bh + 0.35 * ideal_h)))
+                                            new_x = max(0, min(FRAME_WIDTH - new_w, fcx - new_w // 2))
+                                            new_y = max(0, min(FRAME_HEIGHT - new_h, top_y))
+                                            target_box = [new_x, new_y, new_w, new_h]
+                                            tracker.init(frame, tuple(target_box))
+                                            break
+                            except Exception:
+                                pass
+
                         clothes_pct = int(match_score * 100)
                         with vision_state.lock:
                             vision_state.clothes_match_pct = clothes_pct
 
-                        if match_score >= 0.48:
+                        # 3. Model Adaptation (EMA):
+                        # Jika kecocokan sangat tinggi (>= 70%), adaptasikan sedikit variasi pencahayaan
+                        if match_score >= 0.70:
+                            curr_hist = get_clothes_color_signature(frame, target_box)
+                            if curr_hist is not None and target_clothes_hist is not None:
+                                target_clothes_hist = cv2.addWeighted(target_clothes_hist, 0.96, curr_hist, 0.04, 0)
+                                cv2.normalize(target_clothes_hist, target_clothes_hist, alpha=1.0, norm_type=cv2.NORM_L1)
+
+                        if match_score >= 0.42:
                             mismatch_streak = 0
                             status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
                             status_color = (0, 255, 0)
@@ -1054,10 +1154,10 @@ def main():
                             status_color = (0, 165, 255)
 
                             # Jika menempel ke objek salah (seperti monitor/dinding selama >= 5 frame):
-                            # Langsung cari pemilik di seluruh frame dan paksa kotaki kembali!
+                            # Langsung cari pemilik di seluruh frame secara multi-skala dan paksa kotaki kembali!
                             if mismatch_streak >= 5:
-                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
-                                if re_box and re_score >= 0.50:
+                                re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
+                                if re_box and re_score >= 0.48:
                                     print(f"[RE-SNAP] Melepas objek salah, memaksa kotaki pemilik di {re_box} ({int(re_score*100)}%)!")
                                     tracker = create_tracker(current_mode)
                                     tracker.init(frame, re_box)
@@ -1072,10 +1172,10 @@ def main():
                                     status_text = "SCANNING_OWNER"
                                     status_color = (0, 165, 255)
                     else:
-                        # Tracker lepas (misal gerakan cepat):
-                        # Pindai frame untuk mencari pemilik sesuai memori
-                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade)
-                        if re_box and re_score >= 0.50:
+                        # Tracker lepas (misal gerakan cepat / ngereog):
+                        # Pindai frame untuk mencari pemilik sesuai memori secara multi-skala
+                        re_box, re_score = find_target_in_frame(frame, target_clothes_hist, box_w, box_h, face_cascade, current_profile)
+                        if re_box and re_score >= 0.48:
                             print(f"[RE-SNAP] Target pemilik ditemukan ({int(re_score*100)}%)! Langsung mengotaki...")
                             tracker = create_tracker(current_mode)
                             tracker.init(frame, re_box)
@@ -1130,10 +1230,10 @@ def main():
                 else:
                     face_calibrated = False
                     if face_cascade and (frame_counter % 8 == 0):
-                        roi_y1 = max(0, ty)
-                        roi_y2 = min(FRAME_HEIGHT, ty + int(th * 0.65))
-                        roi_x1 = max(0, tx)
-                        roi_x2 = min(FRAME_WIDTH, tx + tw)
+                        roi_y1 = max(0, ty - int(th * 0.45))
+                        roi_y2 = min(FRAME_HEIGHT, ty + int(th * 0.35))
+                        roi_x1 = max(0, tx - 10)
+                        roi_x2 = min(FRAME_WIDTH, tx + tw + 10)
                         if (roi_y2 - roi_y1 >= 25) and (roi_x2 - roi_x1 >= 25):
                             roi_gray = cv2.cvtColor(frame[roi_y1:roi_y2, roi_x1:roi_x2], cv2.COLOR_BGR2GRAY)
                             sub_faces = face_cascade.detectMultiScale(roi_gray, scaleFactor=1.2, minNeighbors=3, minSize=(20, 20))
