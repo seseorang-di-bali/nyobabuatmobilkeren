@@ -708,22 +708,22 @@ def create_app():
     def api_status():
         with vision_state.lock:
             return jsonify({
-                "mode": vision_state.mode,
-                "target_profile": vision_state.target_profile,
-                "status": vision_state.status,
-                "fps": vision_state.fps,
-                "err_x": vision_state.err_x,
-                "err_y": vision_state.err_y,
-                "has_target": vision_state.has_target,
-                "distance_m": round(vision_state.distance_m, 2),
-                "distance_cm": int(vision_state.distance_m * 100),
-                "distance_status": vision_state.distance_status,
-                "serial_state": vision_state.serial_state,
-                "serial_port": vision_state.serial_port,
-                "mirror": vision_state.mirror,
-                "flip_v": vision_state.flip_v,
-                "anti_silau": vision_state.anti_silau,
-                "clothes_match_pct": vision_state.clothes_match_pct
+                "mode": str(vision_state.mode),
+                "target_profile": str(vision_state.target_profile),
+                "status": str(vision_state.status),
+                "fps": float(round(float(vision_state.fps), 1)),
+                "err_x": int(vision_state.err_x),
+                "err_y": int(vision_state.err_y),
+                "has_target": bool(vision_state.has_target),
+                "distance_m": float(round(float(vision_state.distance_m), 2)),
+                "distance_cm": int(float(vision_state.distance_m) * 100),
+                "distance_status": str(vision_state.distance_status),
+                "serial_state": str(vision_state.serial_state),
+                "serial_port": str(vision_state.serial_port),
+                "mirror": bool(vision_state.mirror),
+                "flip_v": bool(vision_state.flip_v),
+                "anti_silau": bool(vision_state.anti_silau),
+                "clothes_match_pct": int(vision_state.clothes_match_pct)
             })
 
     @app.route('/api/reset', methods=['POST', 'GET'])
@@ -1096,7 +1096,9 @@ def main():
                             bx = new_x
                             match_score = best_s
                             if abs(best_dx) >= 10:
-                                tracker.init(frame, tuple(target_box))
+                                tracker = create_tracker(current_mode)
+                                if tracker:
+                                    tracker.init(frame, tuple(target_box))
                         else:
                             match_score = raw_score
 
@@ -1127,7 +1129,9 @@ def main():
                                             new_x = max(0, min(FRAME_WIDTH - new_w, fcx - new_w // 2))
                                             new_y = max(0, min(FRAME_HEIGHT - new_h, top_y))
                                             target_box = [new_x, new_y, new_w, new_h]
-                                            tracker.init(frame, tuple(target_box))
+                                            tracker = create_tracker(current_mode)
+                                            if tracker:
+                                                tracker.init(frame, tuple(target_box))
                                             break
                             except Exception:
                                 pass
