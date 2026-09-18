@@ -21,6 +21,7 @@ import glob
 import socket
 import threading
 import logging
+import subprocess
 import cv2
 import serial
 from flask import Flask, Response, jsonify, render_template_string
@@ -33,19 +34,19 @@ CENTER_Y = FRAME_HEIGHT // 2  # 120
 # Kalibrasi Jarak Monokular (Logitech C170, HFOV ~48°, resolusi 320x240)
 FOCAL_LENGTH_PX = 340.0
 
-# Profil Target Tracking (Badan Penuh / Torso Baju / Wajah)
+# Profil Target Tracking (Badan Belakang / Punggung & Baju / Badan Penuh)
 TARGET_PROFILES = {
-    "body": {
-        "name": "Badan Penuh (Full Body)",
-        "box": (120, 200),
-        "real_h": 1.65,
-        "label": "BADAN PENUH"
-    },
     "torso": {
-        "name": "Badan Atas & Baju (Torso)",
+        "name": "Badan Atas & Baju Punggung",
         "box": (115, 155),
         "real_h": 0.80,
-        "label": "BADAN & BAJU"
+        "label": "BAJU & PUNGGUNG"
+    },
+    "body": {
+        "name": "Badan Penuh & Celana (Full Body)",
+        "box": (120, 200),
+        "real_h": 1.65,
+        "label": "BADAN & CELANA"
     },
     "face": {
         "name": "Wajah Saja (Face)",
@@ -141,16 +142,96 @@ def get_cascade_classifier():
                 return clf
     return None
 
+def enhance_dynamic_range(frame, clip_limit=2.5):
+    """
+    Fitur Anti-Silau / Wide Dynamic Range (WDR):
+    Menerangi bayangan gelap pada tubuh/baju dan meredam cahaya lampu/jendela yang menyilaukan.
+    Menggunakan CLAHE pada channel Luminance (LAB Color Space).
+    """
+    try:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl, a, b))
+        return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    except Exception:
+        return frame
+
+def get_clothes_color_signature(frame, box):
+    """Mengekstrak profil histogram warna HSV pakaian (baju/celana) dari kotak target."""
+    try:
+        x, y, w, h = [int(v) for v in box]
+        x = max(0, min(frame.shape[1] - 1, x))
+        y = max(0, min(frame.shape[0] - 1, y))
+        w = max(4, min(frame.shape[1] - x, w))
+        h = max(4, min(frame.shape[0] - y, h))
+        # Ambil area pakaian (tengah vertikal 25% s.d. 85%, tengah horizontal 20% s.d. 80%)
+        roi = frame[y + int(h*0.25):y + int(h*0.85), x + int(w*0.20):x + int(w*0.80)]
+        if roi.size == 0:
+            return None
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 20, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
+    except Exception:
+        return None
+
+def compare_clothes_color(frame, box, target_hist):
+    """Memeriksa apakah kotak target masih memiliki kecocokan warna pakaian."""
+    if target_hist is None:
+        return 1.0
+    curr_hist = get_clothes_color_signature(frame, box)
+    if curr_hist is None:
+        return 0.5
+    try:
+        score = cv2.compareHist(target_hist, curr_hist, cv2.HISTCMP_CORREL)
+        return max(0.0, min(1.0, score))
+    except Exception:
+        return 0.5
+
+def configure_camera_hardware(cap, cam_device):
+    """
+    Mengoptimalkan setting UVC camera (Logitech C170, dll) di Linux:
+    - Mengaktifkan backlight compensation agar punggung/badan tidak gelap saat backlight terang.
+    - Mengaktifkan power line frequency anti-flicker 50Hz (standar listrik Indonesia).
+    - Menyetel auto-exposure adaptif.
+    """
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+    except Exception:
+        pass
+
+    if sys.platform.startswith('linux') and cam_device and os.path.exists(cam_device):
+        try:
+            # 1. Backlight compensation: mencerahkan subjek di depan cahaya terang
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=backlight_compensation=1"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 2. Anti-flicker 50Hz (lampu ruangan)
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=power_line_frequency=1"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 3. Auto white-balance
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=white_balance_temperature_auto=1"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[CAMERA] Optimasi hardware v4l2 diterapkan pada {cam_device} (Backlight Comp=1, Anti-Flicker=50Hz).")
+        except Exception as e:
+            print(f"[CAMERA INFO] v4l2-ctl opsional tidak dapat dijalankan: {e}")
+
 def create_tracker(tracker_type):
-    """Inisialisasi OpenCV tracker (KCF atau MOSSE)."""
+    """Inisialisasi OpenCV tracker (CSRT, KCF, atau MOSSE)."""
     t_type = tracker_type.lower()
-    if t_type == "mosse":
+    if t_type == "csrt":
+        if hasattr(cv2, "TrackerCSRT_create"):
+            return cv2.TrackerCSRT_create()
+        elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+            return cv2.legacy.TrackerCSRT_create()
+    elif t_type == "mosse":
         if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
             return cv2.legacy.TrackerMOSSE_create()
         elif hasattr(cv2, "TrackerMOSSE_create"):
             return cv2.TrackerMOSSE_create()
     
-    # Default KCF Tracker
+    # Default KCF Tracker (Multi-channel HOG & Color Names)
     if hasattr(cv2, "TrackerKCF_create"):
         return cv2.TrackerKCF_create()
     elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
@@ -165,7 +246,7 @@ class VisionState:
     def __init__(self):
         self.lock = threading.Lock()
         self.latest_jpeg = None
-        self.mode = "mosse"      # Default MOSSE ultra-fast sesuai permintaan
+        self.mode = "kcf"        # Default KCF (stabil, tahan warna & anti-silau)
         self.status = "INITIALIZING"
         self.fps = 0.0
         self.err_x = 0
@@ -182,6 +263,8 @@ class VisionState:
         self.change_profile_req = None
         self.distance_m = 0.0
         self.distance_status = "SEARCHING"
+        self.anti_silau = True   # Default Anti-Silau WDR ON
+        self.clothes_match_pct = 100
 
 vision_state = VisionState()
 
@@ -265,7 +348,12 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
             <div class="stat-card">
                 <span class="stat-label">Mode Tracking</span>
-                <span id="tracking-mode" class="stat-value" style="color: var(--accent-color);">MOSSE</span>
+                <span id="tracking-mode" class="stat-value" style="color: var(--accent-color);">KCF</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Kecocokan Baju</span>
+                <span id="clothes-val" class="stat-value" style="color: var(--success-color);">100%</span>
+                <span id="clothes-status" style="font-size: 0.72rem; color: var(--text-sub); font-weight: 600;">WARNA TERKUNCI</span>
             </div>
             <div class="stat-card">
                 <span class="stat-label">Estimasi Jarak</span>
@@ -304,10 +392,10 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div class="control-panel">
-            <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PROFIL UKURAN TARGET (BADAN / BAJU / WAJAH):</span>
+            <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">PROFIL UKURAN TARGET (PUNGGUNG / BAJU / WAJAH):</span>
             <div class="btn-group">
-                <button id="btn-prof-body" class="btn-secondary" onclick="setProfile('body')">🧍 Badan Penuh (Full Body)</button>
-                <button id="btn-prof-torso" class="btn-primary" onclick="setProfile('torso')">👕 Badan Atas & Baju (Torso)</button>
+                <button id="btn-prof-torso" class="btn-primary" onclick="setProfile('torso')">👕 Baju & Punggung (Torso)</button>
+                <button id="btn-prof-body" class="btn-secondary" onclick="setProfile('body')">🧍 Badan & Celana (Full)</button>
                 <button id="btn-prof-face" class="btn-secondary" onclick="setProfile('face')">😀 Wajah Saja</button>
             </div>
         </div>
@@ -316,9 +404,10 @@ HTML_PAGE = """<!DOCTYPE html>
             <span style="font-size: 0.85rem; font-weight: 600; color: var(--text-sub);">KONTROL TRACKER:</span>
             <div class="btn-group">
                 <button class="btn-warning" onclick="triggerReset()">🎯 Kunci Ulang (Re-Lock)</button>
-                <button id="btn-mode-mosse" class="btn-primary" onclick="switchMode('mosse')">Mode MOSSE (Fast)</button>
-                <button id="btn-mode-kcf" class="btn-secondary" onclick="switchMode('kcf')">Mode KCF</button>
+                <button id="btn-mode-kcf" class="btn-primary" onclick="switchMode('kcf')">Mode KCF (Stabil)</button>
+                <button id="btn-mode-mosse" class="btn-secondary" onclick="switchMode('mosse')">Mode MOSSE (Fast)</button>
                 <button id="btn-mode-face" class="btn-secondary" onclick="switchMode('face')">Mode Wajah</button>
+                <button id="btn-toggle-wdr" class="btn-primary" onclick="toggleAntiSilau()">☀️ Anti-Silau (WDR ON)</button>
                 <button id="btn-toggle-mirror" class="btn-primary" onclick="toggleMirror()">🪞 Mirror (Kiri/Kanan)</button>
                 <button id="btn-toggle-flip-v" class="btn-secondary" onclick="toggleFlipV()">↕️ Flip Vertikal</button>
             </div>
@@ -360,6 +449,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 .then(data => console.log('Flip-V toggled to: ' + data.flip_v));
         }
 
+        function toggleAntiSilau() {
+            fetch('/api/toggle_anti_silau', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => console.log('Anti-Silau toggled to: ' + data.anti_silau));
+        }
+
         function updateTelemetry() {
             fetch('/api/status')
                 .then(res => res.json())
@@ -375,6 +470,27 @@ HTML_PAGE = """<!DOCTYPE html>
                         statusEl.style.color = 'var(--warn-color)';
                     } else {
                         statusEl.style.color = 'var(--danger-color)';
+                    }
+
+                    // Update Kecocokan Warna Pakaian
+                    const clothesEl = document.getElementById('clothes-val');
+                    const clothesStatusEl = document.getElementById('clothes-status');
+                    if (data.has_target) {
+                        const matchPct = (data.clothes_match_pct !== undefined) ? data.clothes_match_pct : 100;
+                        clothesEl.innerText = matchPct + '%';
+                        if (matchPct >= 45) {
+                            clothesEl.style.color = 'var(--success-color)';
+                            clothesStatusEl.innerText = 'WARNA BAJU COCOK';
+                            clothesStatusEl.style.color = 'var(--success-color)';
+                        } else {
+                            clothesEl.style.color = 'var(--warn-color)';
+                            clothesStatusEl.innerText = 'WARNA BEDA/TERHALANG';
+                            clothesStatusEl.style.color = 'var(--warn-color)';
+                        }
+                    } else {
+                        clothesEl.innerText = '--%';
+                        clothesStatusEl.innerText = 'MENUNGGU TARGET';
+                        clothesStatusEl.style.color = 'var(--text-sub)';
                     }
 
                     // Update Jarak Target
@@ -429,7 +545,7 @@ HTML_PAGE = """<!DOCTYPE html>
                         }
                     });
 
-                    // Highlight tombol toggle mirror & flip-v
+                    // Highlight tombol toggle mirror & flip-v & anti-silau
                     const btnMirror = document.getElementById('btn-toggle-mirror');
                     if (btnMirror) {
                         btnMirror.className = data.mirror ? 'btn-primary' : 'btn-secondary';
@@ -437,6 +553,11 @@ HTML_PAGE = """<!DOCTYPE html>
                     const btnFlipV = document.getElementById('btn-toggle-flip-v');
                     if (btnFlipV) {
                         btnFlipV.className = data.flip_v ? 'btn-primary' : 'btn-secondary';
+                    }
+                    const btnWdr = document.getElementById('btn-toggle-wdr');
+                    if (btnWdr) {
+                        btnWdr.className = data.anti_silau ? 'btn-primary' : 'btn-secondary';
+                        btnWdr.innerText = data.anti_silau ? '☀️ Anti-Silau (WDR ON)' : '☀️ Anti-Silau (WDR OFF)';
                     }
                 })
                 .catch(e => console.error(e));
@@ -501,7 +622,9 @@ def create_app():
                 "serial_state": vision_state.serial_state,
                 "serial_port": vision_state.serial_port,
                 "mirror": vision_state.mirror,
-                "flip_v": vision_state.flip_v
+                "flip_v": vision_state.flip_v,
+                "anti_silau": vision_state.anti_silau,
+                "clothes_match_pct": vision_state.clothes_match_pct
             })
 
     @app.route('/api/reset', methods=['POST', 'GET'])
@@ -536,6 +659,13 @@ def create_app():
             new_val = vision_state.flip_v
         return jsonify({"status": "ok", "flip_v": new_val})
 
+    @app.route('/api/toggle_anti_silau', methods=['POST', 'GET'])
+    def api_toggle_anti_silau():
+        with vision_state.lock:
+            vision_state.anti_silau = not vision_state.anti_silau
+            new_val = vision_state.anti_silau
+        return jsonify({"status": "ok", "anti_silau": new_val})
+
     @app.route('/api/mode/<target_mode>', methods=['POST', 'GET'])
     def api_change_mode(target_mode):
         target_mode = target_mode.lower()
@@ -551,22 +681,24 @@ def main():
     parser = argparse.ArgumentParser(description="STB Armbian Vision Tracker with Web HUD")
     parser.add_argument("--camera", type=int, default=None, help="ID Kamera UVC (default: auto-detect)")
     parser.add_argument("--port", type=str, default=None, help="Port Serial ESP32 (contoh: /dev/ttyUSB0)")
-    parser.add_argument("--mode", type=str, choices=["mosse", "kcf", "face"], default="mosse",
-                        help="Mode tracking: 'mosse' (ultra-fast, default), 'kcf' (akurasi menengah), 'face' (deteksi wajah)")
-    parser.add_argument("--profile", type=str, choices=["body", "torso", "face"], default="torso",
-                        help="Profil target: 'body' (seluruh badan), 'torso' (badan atas & baju), 'face' (wajah)")
+    parser.add_argument("--mode", type=str, choices=["kcf", "mosse", "face"], default="kcf",
+                        help="Mode tracking: 'kcf' (stabil, fitur warna & HOG, default), 'mosse' (ultra-fast), 'face' (deteksi wajah)")
+    parser.add_argument("--profile", type=str, choices=["torso", "body", "face"], default="torso",
+                        help="Profil target: 'torso' (baju & punggung, default), 'body' (seluruh badan & celana), 'face' (wajah)")
     parser.add_argument("--headless", action="store_true", help="Paksa mode tanpa GUI HDMI")
     parser.add_argument("--dry-run", action="store_true", help="Simulasi tanpa mengirim serial ke ESP32")
     parser.add_argument("--no-web", action="store_true", help="Nonaktifkan streaming Web HUD")
     parser.add_argument("--web-port", type=int, default=8080, help="Port Web HUD streaming (default: 8080)")
     parser.add_argument("--no-mirror", action="store_true", help="Nonaktifkan mirror horizontal (kamera selfie)")
     parser.add_argument("--flip-v", action="store_true", help="Aktifkan flip vertikal (jika kamera terbalik atas-bawah)")
+    parser.add_argument("--no-wdr", action="store_true", help="Nonaktifkan filter Anti-Silau (Wide Dynamic Range CLAHE)")
     args = parser.parse_args()
 
     vision_state.mirror = not args.no_mirror
     vision_state.flip_v = args.flip_v
     vision_state.target_profile = args.profile
     vision_state.mode = args.mode
+    vision_state.anti_silau = not args.no_wdr
 
     # Cek ketersediaan GUI Display fisik (HDMI / X11)
     has_display = bool(os.environ.get("DISPLAY"))
@@ -584,10 +716,11 @@ def main():
     print("=" * 60)
     print("      STB ARMBIAN VISION TRACKER (ROBOTICS ENGINE)     ")
     print(f" - Resolusi : {FRAME_WIDTH}x{FRAME_HEIGHT} @ 30 FPS")
-    print(f" - Mode     : {args.mode.upper()}")
+    print(f" - Mode     : {args.mode.upper()} (Tracking Punggung & Warna Baju)")
     print(f" - Profil   : {prof_info['name']}")
     print(f" - Kamera   : Index {cam_index} ({cam_device})")
     print(f" - Jarak    : Monocular Vision Estimator Aktif")
+    print(f" - Anti-Silau: {'ON (WDR CLAHE)' if vision_state.anti_silau else 'OFF'}")
     print(f" - Mirror   : {'ON (Horizontal)' if vision_state.mirror else 'OFF'}{' + [FLIP-V]' if vision_state.flip_v else ''}")
     print(f" - UI Mode  : {'HEADLESS (SSH Terminal)' if is_headless else 'DESKTOP GUI (HDMI)'}")
     if not args.no_web:
@@ -639,6 +772,9 @@ def main():
         print("[ERROR] Cek apakah webcam USB sudah terhubung dengan: ls -l /dev/video*")
         return
 
+    # Optimasi Hardware UVC Camera (Backlight Compensation, Anti-Silau & Anti-Flicker)
+    configure_camera_hardware(cap, cam_device)
+
     # Inisialisasi Detektor Wajah (selalu dimuat untuk membantu auto-snap badan & kalibrasi jarak)
     face_cascade = get_cascade_classifier()
 
@@ -649,6 +785,7 @@ def main():
     init_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
     active_lock_box = init_box
     tracker = None
+    target_clothes_hist = None
     tracking_active = False
     lock_countdown_start = time.time()
     countdown_duration = 3.0
@@ -680,6 +817,7 @@ def main():
             with vision_state.lock:
                 do_mirror = vision_state.mirror
                 do_flip_v = vision_state.flip_v
+                do_anti_silau = vision_state.anti_silau
 
             # Mirror horizontal (kamera selfie / pembalik gambar) & Flip vertikal
             if do_mirror and do_flip_v:
@@ -688,6 +826,10 @@ def main():
                 frame = cv2.flip(frame, 1)
             elif do_flip_v:
                 frame = cv2.flip(frame, 0)
+
+            # Optimasi Anti-Silau / Wide Dynamic Range (WDR CLAHE)
+            if do_anti_silau:
+                frame = enhance_dynamic_range(frame)
 
             annotated_frame = frame.copy()
             target_box = None
@@ -698,6 +840,8 @@ def main():
             with vision_state.lock:
                 if vision_state.trigger_reset:
                     tracking_active = False
+                    target_clothes_hist = None
+                    vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     vision_state.trigger_reset = False
                     print("[CONTROL] Reset pelacakan dari Web HUD diterima.")
@@ -711,6 +855,8 @@ def main():
                     init_box = ((FRAME_WIDTH - box_w) // 2, (FRAME_HEIGHT - box_h) // 2, box_w, box_h)
                     active_lock_box = init_box
                     tracking_active = False
+                    target_clothes_hist = None
+                    vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Profil target diubah ke '{prof_info['name']}'.")
 
@@ -719,6 +865,8 @@ def main():
                     vision_state.mode = current_mode
                     vision_state.change_mode_req = None
                     tracking_active = False
+                    target_clothes_hist = None
+                    vision_state.clothes_match_pct = 100
                     lock_countdown_start = time.time()
                     print(f"[CONTROL] Ganti mode ke '{current_mode.upper()}' dari Web HUD.")
 
@@ -776,7 +924,10 @@ def main():
                         tracker = create_tracker(current_mode)
                         if tracker:
                             tracker.init(frame, active_lock_box)
+                            target_clothes_hist = get_clothes_color_signature(frame, active_lock_box)
                             tracking_active = True
+                            with vision_state.lock:
+                                vision_state.clothes_match_pct = 100
                             initial_th = active_lock_box[3]
                             smooth_distance = (prof_info["real_h"] * FOCAL_LENGTH_PX) / max(10, initial_th)
                             print(f"[TRACKER] Target terkunci ({prof_info['name']}) via {current_mode.upper()}!")
@@ -786,11 +937,23 @@ def main():
                     success, box = tracker.update(frame)
                     if success:
                         target_box = [int(v) for v in box]
-                        status_text = "LOCKED_TRACKING"
-                        status_color = (0, 255, 0)
+                        # Verifikasi kecocokan warna pakaian (baju / celana)
+                        match_score = compare_clothes_color(frame, target_box, target_clothes_hist)
+                        clothes_pct = int(match_score * 100)
+                        with vision_state.lock:
+                            vision_state.clothes_match_pct = clothes_pct
+
+                        if match_score >= 0.40:
+                            status_text = f"LOCKED_TRACKING ({clothes_pct}%)"
+                            status_color = (0, 255, 0)
+                        else:
+                            status_text = f"COLOR_MISMATCH ({clothes_pct}%)"
+                            status_color = (0, 165, 255)
                     else:
                         status_text = "TARGET_LOST"
                         status_color = (0, 0, 255)
+                        with vision_state.lock:
+                            vision_state.clothes_match_pct = 0
 
             # --- METODE 2: FACE DETECTOR (CASCADE) ---
             elif current_mode == "face":
@@ -868,6 +1031,8 @@ def main():
 
                 # Badge label target & jarak di atas kotak
                 tag_label = f"{prof_data['label']} | ~{smooth_distance:.2f}m"
+                if current_mode in ["kcf", "mosse"]:
+                    tag_label += f" | Baju:{vision_state.clothes_match_pct}%"
                 cv2.rectangle(annotated_frame, (tx, max(0, ty - 18)), (tx + len(tag_label) * 8 + 6, max(18, ty)), (0, 0, 0), -1)
                 cv2.putText(annotated_frame, tag_label, (tx + 3, max(13, ty - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.40, dist_badge_color, 1)
@@ -962,9 +1127,10 @@ def main():
             if is_headless:
                 if now_time - last_terminal_print > 0.25:
                     if has_target:
-                        print(f"[{status_text:^15}] FPS: {fps:4.1f} | ErrX: {err_x:+4d} px | ErrY: {err_y:+4d} px | Jarak: {smooth_distance:4.2f} m | Serial: {serial_state_str}")
+                        clothes_tag = f" | Baju: {vision_state.clothes_match_pct}%" if current_mode in ["kcf", "mosse"] else ""
+                        print(f"[{status_text:^20}] FPS: {fps:4.1f} | ErrX: {err_x:+4d} px | ErrY: {err_y:+4d} px | Jarak: {smooth_distance:4.2f} m{clothes_tag} | Serial: {serial_state_str}")
                     else:
-                        print(f"[{status_text:^15}] FPS: {fps:4.1f} | Mencari Target...         | Serial: {serial_state_str}")
+                        print(f"[{status_text:^20}] FPS: {fps:4.1f} | Mencari Target...         | Serial: {serial_state_str}")
                     last_terminal_print = now_time
                 time.sleep(0.005)
             else:
