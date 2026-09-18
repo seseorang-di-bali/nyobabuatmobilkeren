@@ -23,6 +23,7 @@ import threading
 import logging
 import subprocess
 import cv2
+import numpy as np
 import serial
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -38,19 +39,19 @@ FOCAL_LENGTH_PX = 340.0
 TARGET_PROFILES = {
     "torso": {
         "name": "Badan Atas & Baju Punggung",
-        "box": (115, 155),
+        "box": (80, 110),
         "real_h": 0.80,
         "label": "BAJU & PUNGGUNG"
     },
     "body": {
         "name": "Badan Penuh & Celana (Full Body)",
-        "box": (120, 200),
+        "box": (95, 160),
         "real_h": 1.65,
         "label": "BADAN & CELANA"
     },
     "face": {
         "name": "Wajah Saja (Face)",
-        "box": (85, 105),
+        "box": (70, 85),
         "real_h": 0.20,
         "label": "WAJAH"
     }
@@ -185,12 +186,12 @@ def derive_body_box_from_face(fx, fy, fw, fh, profile_type="torso"):
     """
     fcx = fx + fw // 2
     if profile_type == "torso":
-        cw = max(32, min(FRAME_WIDTH, int(fw * 2.5)))
-        ch = max(42, min(FRAME_HEIGHT, int(fh * 3.3)))
-        top_y = fy + int(fh * 0.70)
+        cw = max(32, min(FRAME_WIDTH, int(fw * 2.1)))
+        ch = max(42, min(FRAME_HEIGHT, int(fh * 2.7)))
+        top_y = fy + int(fh * 0.75)
     elif profile_type == "body":
-        cw = max(40, min(FRAME_WIDTH, int(fw * 2.8)))
-        ch = max(70, min(FRAME_HEIGHT, int(fh * 6.5)))
+        cw = max(40, min(FRAME_WIDTH, int(fw * 2.4)))
+        ch = max(70, min(FRAME_HEIGHT, int(fh * 5.5)))
         top_y = max(0, fy - int(fh * 0.15))
     else:  # face
         cw, ch = int(fw * 1.2), int(fh * 1.3)
@@ -268,7 +269,7 @@ def get_clothes_color_signature(frame, box):
 
         def compute_patch_hist(roi):
             if roi.size == 0:
-                return None, None
+                return None, None, 0.0, 0.0
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             # 2D HS: 16 bin Hue, 12 bin Saturation (warna kain murni)
             hist_hs = cv2.calcHist([hsv], [0, 1], None, [16, 12], [0, 180, 0, 256])
@@ -276,10 +277,15 @@ def get_clothes_color_signature(frame, box):
             # 1D V: 8 bin Value (tingkat gelap-terang)
             hist_v = cv2.calcHist([hsv], [2], None, [8], [0, 256])
             cv2.normalize(hist_v, hist_v, alpha=1.0, norm_type=cv2.NORM_L1)
-            return hist_hs, hist_v
 
-        u_hs, u_v = compute_patch_hist(roi_upper)
-        l_hs, l_v = compute_patch_hist(roi_lower)
+            # Ekstraksi mean saturasi & variansi tekstur grayscale (0.02 ms, native C)
+            mean_sat = float(np.mean(hsv[:, :, 1]))
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            std_dev = float(np.std(roi_gray))
+            return hist_hs, hist_v, mean_sat, std_dev
+
+        u_hs, u_v, u_sat, u_std = compute_patch_hist(roi_upper)
+        l_hs, l_v, l_sat, l_std = compute_patch_hist(roi_lower)
 
         if u_hs is None and l_hs is None:
             return None
@@ -287,8 +293,12 @@ def get_clothes_color_signature(frame, box):
         return {
             "u_hs": u_hs,
             "u_v": u_v,
+            "u_sat": u_sat,
+            "u_std": u_std,
             "l_hs": l_hs,
-            "l_v": l_v
+            "l_v": l_v,
+            "l_sat": l_sat,
+            "l_std": l_std
         }
     except Exception:
         return None
@@ -296,10 +306,9 @@ def get_clothes_color_signature(frame, box):
 def compare_clothes_color(frame, box, target_sig):
     """
     Memeriksa kecocokan pakaian secara Dual-Zone (Baju Atas + Celana):
-    - 75% bobot pada Hue-Saturation (warna kain asli).
-    - 25% bobot pada Value (kecerahan).
-    - Skor gabungan: 60% Baju Atas + 40% Celana/Bawah.
-    Jika orang lain lewat memakai baju mirip tetapi celananya berbeda, target langsung ditolak!
+    - Jika warna cerah: 75% bobot pada Hue-Saturation (warna kain asli) + 25% Value.
+    - Proteksi Achromatic (Lampu redup / baju abu-abu): Menguji kesamaan tekstur kain
+      agar tidak tertipu kasur, bantal, atau tembok abu-abu yang warnanya mirip.
     """
     if target_sig is None:
         return 1.0
@@ -307,21 +316,36 @@ def compare_clothes_color(frame, box, target_sig):
     if curr_sig is None:
         return 0.5
     try:
-        # Dukungan jika format lama (single numpy array)
         if not isinstance(target_sig, dict):
             return 0.7
 
-        def compare_patch(t_hs, t_v, c_hs, c_v):
+        def compare_patch(t_hs, t_v, t_sat, t_std, c_hs, c_v, c_sat, c_std):
             if t_hs is None or c_hs is None:
                 return 0.5
             s_hs = float(cv2.compareHist(t_hs, c_hs, cv2.HISTCMP_INTERSECT))
             s_v = float(cv2.compareHist(t_v, c_v, cv2.HISTCMP_INTERSECT)) if (t_v is not None and c_v is not None) else 0.5
-            return 0.75 * s_hs + 0.25 * s_v
+
+            avg_sat = 0.5 * ((t_sat or 0.0) + (c_sat or 0.0))
+            # Jika gambar minim saturasi warna (achromatic / abu-abu di ruangan redup):
+            if avg_sat < 28.0:
+                base_s = 0.40 * s_hs + 0.60 * s_v
+                # Bandingkan tekstur/kerutan kain vs kasur/dinding
+                if t_std is not None and c_std is not None:
+                    diff_std = abs(t_std - c_std)
+                    tex_factor = max(0.35, 1.0 - (diff_std / 30.0))
+                    return base_s * tex_factor
+                return base_s * 0.70
+            else:
+                return 0.75 * s_hs + 0.25 * s_v
 
         score_upper = compare_patch(target_sig.get("u_hs"), target_sig.get("u_v"),
-                                    curr_sig.get("u_hs"), curr_sig.get("u_v"))
+                                    target_sig.get("u_sat"), target_sig.get("u_std"),
+                                    curr_sig.get("u_hs"), curr_sig.get("u_v"),
+                                    curr_sig.get("u_sat"), curr_sig.get("u_std"))
         score_lower = compare_patch(target_sig.get("l_hs"), target_sig.get("l_v"),
-                                    curr_sig.get("l_hs"), curr_sig.get("l_v"))
+                                    target_sig.get("l_sat"), target_sig.get("l_std"),
+                                    curr_sig.get("l_hs"), curr_sig.get("l_v"),
+                                    curr_sig.get("l_sat"), curr_sig.get("l_std"))
 
         total_score = 0.60 * score_upper + 0.40 * score_lower
         return max(0.0, min(1.0, float(total_score)))
@@ -346,6 +370,15 @@ def update_clothes_color_signature(target_sig, curr_sig, alpha=0.96):
                 updated[key] = new_h
             else:
                 updated[key] = t_h
+
+        for key in ["u_sat", "u_std", "l_sat", "l_std"]:
+            t_val = target_sig.get(key)
+            c_val = curr_sig.get(key)
+            if t_val is not None and c_val is not None:
+                updated[key] = alpha * t_val + (1.0 - alpha) * c_val
+            else:
+                updated[key] = t_val
+
         return updated
     except Exception:
         return target_sig
@@ -461,7 +494,16 @@ def configure_camera_hardware(cap, cam_device):
             # 3. Auto white-balance
             subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=white_balance_temperature_auto=1"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[CAMERA] Optimasi hardware v4l2 diterapkan pada {cam_device} (Backlight Comp=1, Anti-Flicker=50Hz).")
+            # 4. Boost saturasi hardware (Logitech C170 default 32 sangat pucat di ruangan remang; 64 mengembalikan warna RGB asli)
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=saturation=64"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 5. Naikkan kontras hardware agar pakaian terpisah jelas dari dinding / kasur
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=contrast=38"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 6. Naikkan ketajaman (sharpness)
+            subprocess.run(["v4l2-ctl", "-d", cam_device, "--set-ctrl=sharpness=32"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[CAMERA] Optimasi hardware v4l2 diterapkan pada {cam_device} (Backlight Comp=1, 50Hz, Saturation=64, Contrast=38).")
         except Exception as e:
             print(f"[CAMERA INFO] v4l2-ctl opsional tidak dapat dijalankan: {e}")
 
