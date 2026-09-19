@@ -20,8 +20,8 @@ python3 -c "import ultralytics; import flask" 2>/dev/null || {
 sudo chmod 666 /dev/ttyUSB* 2>/dev/null || true
 sudo chmod 666 /dev/ttyACM* 2>/dev/null || true
 
-# 3. Izinkan akses display X11 lokal jika ada sesi desktop
-xhost +local: 2>/dev/null || true
+# 3. Mencegah crash Qt XCB di Linux Wayland / headless
+export QT_QPA_PLATFORM=offscreen
 
 # 4. Jalankan AI Tracker dengan Web HUD bawaan di Port 8080
 python3 ai_human_follower_pc.py "$@"

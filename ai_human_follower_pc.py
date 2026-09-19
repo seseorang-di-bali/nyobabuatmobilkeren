@@ -16,6 +16,10 @@ Fitur Unggulan:
 
 import sys
 import os
+
+# Mencegah crash Qt XCB pada Linux Wayland / Pop!_OS
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 import time
 import glob
 import math
@@ -506,7 +510,7 @@ def main():
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="Bobot model YOLO (default: yolov8n.pt)")
     parser.add_argument("--conf", type=float, default=0.50, help="Ambang batas kepercayaan (default: 0.50)")
     parser.add_argument("--web-port", type=int, default=8080, help="Port Web HUD (default: 8080)")
-    parser.add_argument("--no-gui", action="store_true", help="Jalankan hanya via Web HUD (tanpa jendela GUI desktop)")
+    parser.add_argument("--gui", action="store_true", help="Buka jendela pop-up GUI desktop (jika display X11 aktif)")
     parser.add_argument("--dry-run", action="store_true", help="Jalankan simulasi tanpa kirim serial")
     args = parser.parse_args()
 
@@ -563,11 +567,12 @@ def main():
 
     locked_track_id = None
     last_fps_time = time.time()
+    last_terminal_print = 0.0
     frame_count = 0
     fps = 30.0
-    gui_active = not args.no_gui
+    gui_active = args.gui
 
-    # Coba buat window GUI secara aman (jika XCB / Display gagal, lanjut via Web HUD)
+    # Coba buat window GUI jika diminta (--gui)
     if gui_active:
         try:
             cv2.namedWindow("Xiaomi Style AI Follower (Full-Body 360)", cv2.WINDOW_NORMAL)
@@ -683,6 +688,15 @@ def main():
                     vision_state.err_x = 0
                     vision_state.err_y = 0
                     vision_state.fps = fps
+
+            # Cetak Telemetri Realtime ke Terminal (4 kali per detik)
+            if now - last_terminal_print >= 0.25:
+                last_terminal_print = now
+                ser_st = serial_sender.status
+                if target_human is not None:
+                    print(f"[LOCKED: ID #{target_human['id']} ({int(target_human['conf']*100)}%)] FPS: {fps:4.1f} | ErrX: {err_x:+4d} px | ErrY: {err_y:+4d} px | Jarak: {dist_m:4.2f} m | Serial: {ser_st}")
+                else:
+                    print(f"[      SCANNING 360      ] FPS: {fps:4.1f} | Mencari Target Manusia...     | Serial: {ser_st}")
 
             # Encode JPEG untuk Web HUD
             ret_enc, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
