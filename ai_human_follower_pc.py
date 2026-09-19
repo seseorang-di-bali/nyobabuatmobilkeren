@@ -920,6 +920,11 @@ def main():
     except KeyboardInterrupt:
         print("\n[STOP] Program dihentikan pengguna.")
     finally:
+        try:
+            learner.save_learned_params()
+            print(f"[AI LEARNER] Parameter hasil training tersimpan aman di '{learner.config_path}'.")
+        except Exception:
+            pass
         serial_sender.close()
         cap.release()
         try:
