@@ -146,11 +146,11 @@ class ContinuousServoLearner:
             if os.path.exists(self.config_path):
                 with open(self.config_path, "r") as f:
                     data = json.load(f)
-                    self.learned_speed_pan = int(data.get("speed_pan", 45))
-                    self.learned_speed_tilt = int(data.get("speed_tilt", 30))
-                    self.learned_smooth = int(data.get("smooth", 85))
-                    self.learned_deadzone_x = int(data.get("deadzone_x", 12))
-                    self.learned_deadzone_y = int(data.get("deadzone_y", 14))
+                    self.learned_speed_pan = max(45, min(85, int(data.get("speed_pan", 55))))
+                    self.learned_speed_tilt = max(30, min(70, int(data.get("speed_tilt", 35))))
+                    self.learned_smooth = max(70, min(92, int(data.get("smooth", 85))))
+                    self.learned_deadzone_x = max(6, min(12, int(data.get("deadzone_x", 8))))
+                    self.learned_deadzone_y = max(8, min(14, int(data.get("deadzone_y", 10))))
                     self.best_loss = float(data.get("best_loss", 999.0))
                     self.iteration = int(data.get("iteration", 0))
                     print(f"[AI LEARNER] Memuat model tersimpan: Iterasi #{self.iteration}, Best Loss: {self.best_loss:.1f}, Speed Pan: {self.learned_speed_pan}%")
@@ -723,11 +723,19 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="Indeks kamera USB (default: 0)")
     parser.add_argument("--port", type=str, default=None, help="Port serial ESP32 (contoh: /dev/ttyUSB0)")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="Bobot model YOLO (default: yolov8n.pt)")
-    parser.add_argument("--conf", type=float, default=0.50, help="Ambang batas kepercayaan (default: 0.50)")
+    parser.add_argument("--conf", type=float, default=0.30, help="Ambang batas kepercayaan YOLO (default: 0.30)")
     parser.add_argument("--web-port", type=int, default=8080, help="Port Web HUD (default: 8080)")
     parser.add_argument("--gui", action="store_true", help="Buka jendela pop-up GUI desktop (jika display X11 aktif)")
     parser.add_argument("--dry-run", action="store_true", help="Jalankan simulasi tanpa kirim serial")
+    parser.add_argument("--reset-ai", action="store_true", help="Reset parameter pembelajaran AI ke nilai optimal default")
     args = parser.parse_args()
+
+    if args.reset_ai and os.path.exists("servo_learned_ai.json"):
+        try:
+            os.remove("servo_learned_ai.json")
+            print("[AI LEARNER] File parameter lama 'servo_learned_ai.json' berhasil di-reset ke default!")
+        except Exception:
+            pass
 
     print("=" * 65)
     print("   XIAOMI / DJI STYLE HIGH-PRECISION FULL-BODY AI FOLLOWER   ")
@@ -784,6 +792,8 @@ def main():
     smooth_err_x = 0.0
     smooth_err_y = 0.0
     locked_track_id = None
+    last_valid_human = None
+    coasting_counter = 0
     last_fps_time = time.time()
     last_terminal_print = 0.0
     frame_count = 0
@@ -851,9 +861,13 @@ def main():
                         "cy": y1 + bh // 2
                     })
 
-            # 6. Logika Penguncian Target Cerdas (ID Persistence)
+            # 6. Logika Penguncian Target Cerdas (Single-Person Priority & ID Persistence)
             target_human = None
-            if len(detected_humans) > 0:
+            if len(detected_humans) == 1:
+                # Hanya ada 1 orang di depan kamera -> Prioritas langsung kunci tanpa ragu!
+                target_human = detected_humans[0]
+                locked_track_id = target_human["id"]
+            elif len(detected_humans) > 1:
                 if locked_track_id is not None:
                     for h_obj in detected_humans:
                         if h_obj["id"] == locked_track_id:
@@ -867,6 +881,18 @@ def main():
                     target_human = detected_humans[0]
                     locked_track_id = target_human["id"]
 
+            # 6b. Target Coasting Memory (Mencegah dropout jika deteksi drop 1-12 frame)
+            if target_human is not None:
+                coasting_counter = 0
+                last_valid_human = target_human
+            elif last_valid_human is not None and coasting_counter < 12:
+                # Coasting: gunakan posisi terakhir agar tracking tidak putus-putus
+                coasting_counter += 1
+                target_human = last_valid_human
+            else:
+                last_valid_human = None
+                coasting_counter = 0
+
             # 7. Hitung Deviasi & Kirim ke ESP32
             if target_human is not None:
                 bx, by, bw, bh = target_human["box"]
@@ -879,27 +905,15 @@ def main():
                 # Step pembelajaran mandiri (Continuous Online Auto-Trainer)
                 learner.step(raw_err_x, raw_err_y, bw, bh)
 
-                # Filter Anti-Jitter Ringan Tanpa Phase Lag (alpha = 0.75)
+                # Filter Anti-Jitter Ringan Tanpa Phase Lag (alpha = 0.80)
                 # Mencegah jitter kamera 1-2px tanpa menyebabkan keterlambatan pengereman servo
-                smooth_err_x = 0.75 * raw_err_x + 0.25 * smooth_err_x
-                smooth_err_y = 0.75 * raw_err_y + 0.25 * smooth_err_y
+                smooth_err_x = 0.80 * raw_err_x + 0.20 * smooth_err_x
+                smooth_err_y = 0.80 * raw_err_y + 0.20 * smooth_err_y
 
-                # Deadzone dinamis adaptif hasil training AI
-                eff_deadzone_x = learner.learned_deadzone_x
-                eff_deadzone_y = learner.learned_deadzone_y
-
-                # Jika deviasi berada di dalam deadzone tengah -> servo DIAM TOTAL (send 0)
-                if abs(smooth_err_x) <= eff_deadzone_x:
-                    send_err_x = 0
-                else:
-                    gain_scale_x = learner.learned_speed_pan / 50.0
-                    send_err_x = int(smooth_err_x * gain_scale_x)
-
-                if abs(smooth_err_y) <= eff_deadzone_y:
-                    send_err_y = 0
-                else:
-                    gain_scale_y = learner.learned_speed_tilt / 50.0
-                    send_err_y = int(smooth_err_y * gain_scale_y)
+                # Kirim error piksel murni ke ESP32 agar PD controller di ESP32 bekerja presisi
+                # (Deadzone +/- 8px dan rem elektronik KD ditangani secara hardware-level oleh ESP32)
+                send_err_x = int(smooth_err_x)
+                send_err_y = int(smooth_err_y)
 
                 dist_m = (HUMAN_REAL_HEIGHT_M * FOCAL_LENGTH_PX) / max(20, bh)
                 dist_m = max(0.5, min(8.0, dist_m))
@@ -912,7 +926,8 @@ def main():
 
                 with vision_state.lock:
                     vision_state.has_target = True
-                    vision_state.status = f"LOCKED: ID #{target_human['id']} ({int(target_human['conf']*100)}%)"
+                    target_label = f"ID #{target_human['id']}" if target_human['id'] is not None else "TARGET"
+                    vision_state.status = f"LOCKED: {target_label} ({int(target_human['conf']*100)}%)"
                     vision_state.target_id = target_human['id']
                     vision_state.conf = target_human['conf']
                     vision_state.distance_m = dist_m

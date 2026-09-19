@@ -45,15 +45,15 @@ const float TILT_MAX = 120.0;
 const float TILT_MID = 90.0;
 
 // Parameter Kendali PD Cerdas (Proportional + Derivative Electronic Damping)
-// Mengeliminasi osilasi / overshooting saat diam, serta mengunci target di tengah dengan tenang
-const int   DEADZONE_PAN_PX   = 12;    // Zona tenang horizontal: di dalam +/- 12px servo DIAM TOTAL
-const int   DEADZONE_TILT_PX  = 14;    // Zona tenang vertikal: di dalam +/- 14px tilt DIAM TOTAL
-const float KP_PAN            = 0.0070;// Penguatan proporsional horizontal stabil untuk rate 50 Hz
-const float KD_PAN            = 0.0050;// Rem elektronik instan (Derivative Damping) saat mendekati tengah
-const float KP_TILT           = 0.0040;// Penguatan proporsional vertikal
-const float KD_TILT           = 0.0030;// Rem elektronik vertikal
-const float MAX_STEP_PAN      = 1.2;   // Batas pergerakan per paket (derajat) - halus bebas sentak
-const float MAX_STEP_TILT     = 0.8;   // Batas pergerakan vertikal per paket
+// Menjaga pergerakan tetap gesit & responsif, namun bebas osilasi / overshooting saat diam
+const int   DEADZONE_PAN_PX   = 8;     // Zona tenang horizontal: di dalam +/- 8px servo DIAM TOTAL
+const int   DEADZONE_TILT_PX  = 10;    // Zona tenang vertikal: di dalam +/- 10px tilt DIAM TOTAL
+const float KP_PAN            = 0.018; // Penguatan proporsional horizontal responsif (gesit mengikuti target)
+const float KD_PAN            = 0.012; // Rem elektronik instan (Derivative Damping) aktif saat mendekati tengah
+const float KP_TILT           = 0.012; // Penguatan proporsional vertikal responsif
+const float KD_TILT           = 0.008; // Rem elektronik vertikal
+const float MAX_STEP_PAN      = 2.5;   // Maksimal 2.5 derajat per packet (gesit, tidak lelet atau macet)
+const float MAX_STEP_TILT     = 1.5;   // Maksimal 1.5 derajat vertikal per packet
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
 // Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)

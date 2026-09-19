@@ -24,4 +24,4 @@ sudo chmod 666 /dev/ttyACM* 2>/dev/null || true
 export QT_QPA_PLATFORM=offscreen
 
 # 4. Jalankan AI Tracker dengan Web HUD bawaan di Port 8080
-python3 ai_human_follower_pc.py "$@"
+python3 ai_human_follower_pc.py --conf 0.30 "$@"
