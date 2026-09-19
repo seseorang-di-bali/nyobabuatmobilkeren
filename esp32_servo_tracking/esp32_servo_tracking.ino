@@ -44,13 +44,16 @@ const float TILT_MIN = 60.0;  // Batasi agar tidak mendongak/menunduk terlalu ek
 const float TILT_MAX = 120.0;
 const float TILT_MID = 90.0;
 
-// Parameter Kendali Servo Proporsional Cepat & Responsif (Xiaomi / DJI Gimbal Speed)
-const int DEADZONE_PAN_PX   = 8;     // Deadzone sempit, langsung bereaksi saat Anda bergerak
-const int DEADZONE_TILT_PX  = 10;    // Deadzone vertikal responsif
-const float KP_PAN          = 0.040; // 2.5x lebih lincah dan cepat merespons gerakan tubuh
-const float KP_TILT         = 0.022; // 3x lebih cepat & responsif mengikuti tinggi badan
-const float MAX_STEP_PAN    = 3.5;   // Maksimal 3.5 derajat per packet (sangat gesit & anti-lelet)
-const float MAX_STEP_TILT   = 2.0;   // Maksimal 2.0 derajat per packet
+// Parameter Kendali PD Cerdas (Proportional + Derivative Electronic Damping)
+// Mengeliminasi osilasi / overshooting saat diam, serta mengunci target di tengah dengan tenang
+const int   DEADZONE_PAN_PX   = 12;    // Zona tenang horizontal: di dalam +/- 12px servo DIAM TOTAL
+const int   DEADZONE_TILT_PX  = 14;    // Zona tenang vertikal: di dalam +/- 14px tilt DIAM TOTAL
+const float KP_PAN            = 0.0070;// Penguatan proporsional horizontal stabil untuk rate 50 Hz
+const float KD_PAN            = 0.0050;// Rem elektronik instan (Derivative Damping) saat mendekati tengah
+const float KP_TILT           = 0.0040;// Penguatan proporsional vertikal
+const float KD_TILT           = 0.0030;// Rem elektronik vertikal
+const float MAX_STEP_PAN      = 1.2;   // Batas pergerakan per paket (derajat) - halus bebas sentak
+const float MAX_STEP_TILT     = 0.8;   // Batas pergerakan vertikal per paket
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
 // Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)
@@ -79,6 +82,8 @@ inline int angleToMicros(float deg) {
 
 int targetErrX = 0;
 int targetErrY = 0;
+int prevTargetErrX = 0;
+int prevTargetErrY = 0;
 int cameraDistCm = 0;
 
 int laserDistCm = -1;
@@ -142,6 +147,8 @@ void processPacket(char* pkt) {
     targetLocked = false;
     targetErrX = 0;
     targetErrY = 0;
+    prevTargetErrX = 0;
+    prevTargetErrY = 0;
     cameraDistCm = 0;
     return;
   }
@@ -164,23 +171,33 @@ void processPacket(char* pkt) {
       targetLocked = true;
       lastPacketTime = millis();
 
-      // 2. KENDALI PROPORSIONAL TARGET SUDUT SERVO (BEBAS SENTAK)
-      // Pan: Perbarui target sudut horizontal
-      if (abs(targetErrX) > DEADZONE_PAN_PX) {
+      // KENDALI PD CERDAS DENGAN ELECTRONIC DAMPING (ANTI-OVERSHOOT)
+      // 1. Pan (Horizontal): Hitung langkah sudut dengan rem derivatif
+      if (abs(targetErrX) <= DEADZONE_PAN_PX) {
+        // Target berada di zona tenang tengah -> servo diam 100% tanpa jitter
+        prevTargetErrX = targetErrX;
+      } else {
         float dirPan = INVERT_PAN ? 1.0 : -1.0;
-        float deltaPan = dirPan * (targetErrX * KP_PAN);
+        float dErrX = (float)(targetErrX - prevTargetErrX);
+        // Rumus PD: KP * Error + KD * Derivatif (Rem aktif saat dErr berlawanan tanda)
+        float deltaPan = dirPan * ((targetErrX * KP_PAN) + (dErrX * KD_PAN));
         deltaPan = constrain(deltaPan, -MAX_STEP_PAN, MAX_STEP_PAN);
         targetPanAngle += deltaPan;
         targetPanAngle = constrain(targetPanAngle, PAN_MIN, PAN_MAX);
+        prevTargetErrX = targetErrX;
       }
 
-      // Tilt: Perbarui target sudut vertikal
-      if (abs(targetErrY) > DEADZONE_TILT_PX) {
+      // 2. Tilt (Vertikal): Hitung langkah sudut vertikal dengan rem derivatif
+      if (abs(targetErrY) <= DEADZONE_TILT_PX) {
+        prevTargetErrY = targetErrY;
+      } else {
         float dirTilt = INVERT_TILT ? -1.0 : 1.0;
-        float deltaTilt = dirTilt * (targetErrY * KP_TILT);
+        float dErrY = (float)(targetErrY - prevTargetErrY);
+        float deltaTilt = dirTilt * ((targetErrY * KP_TILT) + (dErrY * KD_TILT));
         deltaTilt = constrain(deltaTilt, -MAX_STEP_TILT, MAX_STEP_TILT);
         targetTiltAngle += deltaTilt;
         targetTiltAngle = constrain(targetTiltAngle, TILT_MIN, TILT_MAX);
+        prevTargetErrY = targetErrY;
       }
     }
   }
