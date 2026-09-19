@@ -1610,8 +1610,11 @@ def main():
     vision_state.mode = args.mode
     vision_state.anti_silau = args.wdr
 
-    # Cek ketersediaan GUI Display fisik (HDMI / X11)
-    has_display = bool(os.environ.get("DISPLAY"))
+    # Cek ketersediaan GUI Display fisik (HDMI / X11 / Windows / Mac)
+    if sys.platform.startswith('win') or sys.platform == 'darwin':
+        has_display = True
+    else:
+        has_display = bool(os.environ.get("DISPLAY"))
     is_headless = args.headless or not has_display
 
     # Auto-detect camera index
