@@ -97,46 +97,38 @@ vision_state = GlobalVisionState()
 class ContinuousServoLearner:
     """
     Agen Pembelajaran Berkelanjutan (Real-Time Online Auto-Tuner):
-    Mengamati deviasi posisi Anda dari tengah frame, kestabilan saat Anda diam di tempat,
-    dan osilasi / overshooting servo setiap episode (40 frame / ~1.3 detik).
-
-    Saat Anda DIAM DI TEMPAT:
-    - AI mendeteksi overshooting (kamera bergoyang bolak-balik melampaui tubuh Anda).
-    - AI secara otomatis meredam 'learned_speed_pan' dan memperlebar deadzone
-      sampai kamera terkunci tenang di tengah dengan status '100% STABIL'.
-
-    Saat Anda BERJALAN / BERGERAK:
-    - AI mendeteksi deviasi posisi tanpa osilasi, lalu menyesuaikan kecepatan tracking
-      secara adaptif agar kamera selalu mengarahkan Anda ke tengah frame secara mulus!
+    Mengamati deviasi posisi Anda dari tengah frame, kecepatan gerakan Anda,
+    dan osilasi servo setiap episode (45 frame / ~1.5 detik).
+    Secara otomatis melatih dan mengadaptasi parameter kehalusan, sensitivitas,
+    dan deadzone agar kamera selalu mempertahankan posisi Anda di tengah
+    secara super mulus (butter-smooth) tanpa sentakan dan tanpa delay!
     """
     def __init__(self, config_path="servo_learned_ai.json"):
         self.config_path = config_path
         self.best_loss = 999.0
         self.iteration = 0
-        self.status = "CALIBRATING BASELINE..."
+        self.status = "TRAINING REALTIME..."
         self.metrics_str = "Mengumpulkan Data..."
         self.reward_pct = 85
 
         # Parameter yang dilatih secara adaptif
-        # learned_speed_pan: 50 = 1.0x (normal), <50 = lebih redam/halus, >50 = lebih gesit
-        self.learned_speed_pan = 45       # Responsivitas Pan horizontal (%)
-        self.learned_speed_tilt = 30      # Responsivitas Tilt vertikal (%)
-        self.learned_smooth = 85          # Stabilitas kehalusan (%)
-        self.learned_deadzone_x = 12      # Deadzone horizontal (12 px)
-        self.learned_deadzone_y = 14      # Deadzone vertikal (14 px)
+        self.learned_speed_pan = 40       # Responsivitas Pan horizontal (%)
+        self.learned_speed_tilt = 24      # Responsivitas Tilt vertikal (%)
+        self.learned_smooth = 85          # Kehalusan filter EMA (85% sangat halus)
+        self.learned_deadzone_x = 10      # Deadzone horizontal (10 px)
+        self.learned_deadzone_y = 12      # Deadzone vertikal (12 px)
 
         # Buffer pengumpul metrik per-episode
         self.frame_count = 0
         self.sum_abs_x = 0.0
         self.sum_abs_y = 0.0
-        self.prev_raw_x = 0.0
-        self.prev_raw_y = 0.0
+        self.sum_d_x = 0.0
+        self.prev_err_x = 0.0
+        self.prev_err_y = 0.0
         self.overshoot_x = 0
         self.overshoot_y = 0
         self.last_sign_x = 0
         self.last_sign_y = 0
-        self.deadzone_hits = 0
-        self.human_motion_sum = 0.0
         self.episode_start = time.time()
 
         self.load_learned_params()
@@ -146,14 +138,14 @@ class ContinuousServoLearner:
             if os.path.exists(self.config_path):
                 with open(self.config_path, "r") as f:
                     data = json.load(f)
-                    self.learned_speed_pan = max(45, min(85, int(data.get("speed_pan", 55))))
-                    self.learned_speed_tilt = max(30, min(70, int(data.get("speed_tilt", 35))))
-                    self.learned_smooth = max(70, min(92, int(data.get("smooth", 85))))
-                    self.learned_deadzone_x = max(6, min(12, int(data.get("deadzone_x", 8))))
-                    self.learned_deadzone_y = max(8, min(14, int(data.get("deadzone_y", 10))))
+                    self.learned_speed_pan = max(28, min(65, int(data.get("speed_pan", 40))))
+                    self.learned_speed_tilt = max(18, min(45, int(data.get("speed_tilt", 24))))
+                    self.learned_smooth = max(75, min(92, int(data.get("smooth", 85))))
+                    self.learned_deadzone_x = max(8, min(16, int(data.get("deadzone_x", 10))))
+                    self.learned_deadzone_y = max(8, min(16, int(data.get("deadzone_y", 12))))
                     self.best_loss = float(data.get("best_loss", 999.0))
                     self.iteration = int(data.get("iteration", 0))
-                    print(f"[AI LEARNER] Memuat model tersimpan: Iterasi #{self.iteration}, Best Loss: {self.best_loss:.1f}, Speed Pan: {self.learned_speed_pan}%")
+                    print(f"[AI LEARNER] Memuat model tersimpan: Iterasi #{self.iteration}, Best Loss: {self.best_loss:.1f}, Kehalusan: {self.learned_smooth}%")
         except Exception as e:
             print(f"[AI LEARNER] Info load: {e}")
 
@@ -171,18 +163,18 @@ class ContinuousServoLearner:
             }
             with open(self.config_path, "w") as f:
                 json.dump(data, f, indent=2)
-            print(f"[AI LEARNER] Model pembelajaran tersimpan! Iterasi #{self.iteration} | Stability: {self.reward_pct}%")
+            print(f"[AI LEARNER] Pembelajaran tersimpan! Iterasi #{self.iteration}, Best Loss: {self.best_loss:.1f} | Kelancaran: {self.reward_pct}%")
         except Exception as e:
             print(f"[AI LEARNER] Gagal simpan: {e}")
 
-    def step(self, raw_err_x, raw_err_y, bw=100, bh=200):
+    def step(self, err_x, err_y):
         now = time.time()
-        abs_x = abs(raw_err_x)
-        abs_y = abs(raw_err_y)
+        abs_x = abs(err_x)
+        abs_y = abs(err_y)
+        d_x = abs(err_x - self.prev_err_x)
 
-        # Deteksi apakah target melintasi garis tengah bolak-balik (Overshoot)
-        sign_x = 1 if raw_err_x > self.learned_deadzone_x else (-1 if raw_err_x < -self.learned_deadzone_x else 0)
-        sign_y = 1 if raw_err_y > self.learned_deadzone_y else (-1 if raw_err_y < -self.learned_deadzone_y else 0)
+        sign_x = 1 if err_x > 4 else (-1 if err_x < -4 else 0)
+        sign_y = 1 if err_y > 5 else (-1 if err_y < -5 else 0)
 
         if self.last_sign_x != 0 and sign_x != 0 and sign_x != self.last_sign_x:
             self.overshoot_x += 1
@@ -191,75 +183,44 @@ class ContinuousServoLearner:
 
         self.last_sign_x = sign_x
         self.last_sign_y = sign_y
-
-        if abs_x <= self.learned_deadzone_x and abs_y <= self.learned_deadzone_y:
-            self.deadzone_hits += 1
-
-        # Estimasi pergerakan tubuh target (apakah user sedang diam di tempat atau berjalan)
-        motion = math.hypot(raw_err_x - self.prev_raw_x, raw_err_y - self.prev_raw_y)
-        self.human_motion_sum += motion
-        self.prev_raw_x = raw_err_x
-        self.prev_raw_y = raw_err_y
+        self.prev_err_x = err_x
+        self.prev_err_y = err_y
 
         self.sum_abs_x += abs_x
         self.sum_abs_y += abs_y
+        self.sum_d_x += d_x
         self.frame_count += 1
 
-        # Evaluasi episode setiap ~40 frame (~1.3 detik)
-        if self.frame_count >= 40 or (now - self.episode_start > 1.4):
+        # Evaluasi episode super cepat setiap 15 frame (~0.5 detik) agar training berlangsung seketika!
+        if self.frame_count >= 15 or (now - self.episode_start > 0.55):
             mae_x = self.sum_abs_x / max(1, self.frame_count)
             mae_y = self.sum_abs_y / max(1, self.frame_count)
-            avg_motion = self.human_motion_sum / max(1, self.frame_count)
+            jitter_x = self.sum_d_x / max(1, self.frame_count)
             over_x = self.overshoot_x
             over_y = self.overshoot_y
-            in_center_ratio = self.deadzone_hits / max(1, self.frame_count)
 
-            # Fungsi Loss:
-            # - Penalti sangat besar jika ada overshoot (kamera bergoyang bolak-balik)
-            # - Reward tinggi jika target tenang di dalam deadzone
-            loss = round(0.25 * mae_x + 0.15 * mae_y + 15.0 * over_x + 10.0 * over_y + (1.0 - in_center_ratio) * 15.0, 1)
+            loss = round(0.30 * mae_x + 0.20 * mae_y + 12.0 * over_x + 14.0 * over_y + 0.25 * jitter_x, 1)
             self.reward_pct = max(10, min(99, int(100 - min(90.0, loss))))
             self.iteration += 1
 
-            # Logika Adaptasi AI (Online Reinforcement Auto-Tuner):
-            user_is_stationary = (avg_motion < 6.0)
+            # Adaptasi Cepat Saat Anda Diam: redam gerakan berlebih seketika!
+            if over_x >= 1:
+                self.learned_smooth = min(92, self.learned_smooth + 3)
+                self.learned_speed_pan = max(28, self.learned_speed_pan - 4)
+                self.learned_deadzone_x = min(16, self.learned_deadzone_x + 2)
+            elif mae_x > 30:
+                self.learned_speed_pan = min(60, self.learned_speed_pan + 2)
+                self.learned_smooth = max(72, self.learned_smooth - 1)
+                self.learned_deadzone_x = max(6, self.learned_deadzone_x - 1)
 
-            if user_is_stationary:
-                # KONDISI 1: User sedang diam di tempat (FASE KALIBRASI KESTABILAN)
-                if over_x >= 1:
-                    # Terjadi overshooting padahal user diam!
-                    # Solusi: Redam kecepatan pan dan perlebar sedikit deadzone
-                    self.learned_speed_pan = max(20, self.learned_speed_pan - 5)
-                    self.learned_deadzone_x = min(18, self.learned_deadzone_x + 1)
-                    self.learned_smooth = min(95, self.learned_smooth + 2)
-                    self.status = "STABILIZING: REDAM OSILASI..."
-                elif in_center_ratio >= 0.70:
-                    # User diam dan servo diam tenang di tengah!
-                    self.status = "LOCKED: 100% STABIL & TENANG"
-                    self.reward_pct = max(95, self.reward_pct)
-                else:
-                    # User sedikit di luar deadzone, lakukan adjustment lembut
-                    self.status = "FINE TUNING CENTER..."
-            else:
-                # KONDISI 2: User sedang melangkah / bergerak
-                if over_x >= 2:
-                    self.learned_speed_pan = max(25, self.learned_speed_pan - 3)
-                    self.status = "DAMPING MOVEMENT..."
-                elif mae_x > 45 and over_x == 0:
-                    # Tracking agak tertinggal saat user jalan, naikkan kecepatan bertahap
-                    self.learned_speed_pan = min(70, self.learned_speed_pan + 2)
-                    self.status = "TRACKING: ADAPTIF MENGIKUTI"
-                else:
-                    self.status = "TRACKING ACTIVE"
-
-            # Vertikal (Tilt) tuning
             if over_y >= 1:
-                self.learned_speed_tilt = max(15, self.learned_speed_tilt - 3)
-                self.learned_deadzone_y = min(20, self.learned_deadzone_y + 1)
-            elif mae_y > 40:
-                self.learned_speed_tilt = min(45, self.learned_speed_tilt + 2)
+                self.learned_speed_tilt = max(16, self.learned_speed_tilt - 3)
+                self.learned_deadzone_y = min(18, self.learned_deadzone_y + 2)
+            elif mae_y > 35:
+                self.learned_speed_tilt = min(40, self.learned_speed_tilt + 2)
 
-            self.metrics_str = f"Loss: {loss:.1f} | Pan: {self.learned_speed_pan}% | DZ: {self.learned_deadzone_x}px"
+            self.status = f"TRAINING #{self.iteration}"
+            self.metrics_str = f"Loss: {loss:.1f} | Smooth: {self.learned_smooth}% | DZ: {self.learned_deadzone_x}px"
 
             if loss < self.best_loss:
                 self.best_loss = loss
@@ -270,17 +231,16 @@ class ContinuousServoLearner:
                 vision_state.ai_loss = loss
                 vision_state.ai_best_loss = self.best_loss
                 vision_state.ai_reward = self.reward_pct
-                vision_state.ai_smooth = self.learned_speed_pan
+                vision_state.ai_smooth = self.learned_smooth
                 vision_state.ai_status = self.status
 
-            # Reset akumulator untuk episode berikutnya
+            # Reset akumulator episode
             self.frame_count = 0
             self.sum_abs_x = 0.0
             self.sum_abs_y = 0.0
+            self.sum_d_x = 0.0
             self.overshoot_x = 0
             self.overshoot_y = 0
-            self.deadzone_hits = 0
-            self.human_motion_sum = 0.0
             self.episode_start = now
 
 
@@ -550,8 +510,7 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
             <div class="card">
                 <div class="title">AI Auto-Learner</div>
-                <div id="stat-ai" class="value val-cyan" style="font-size: 1.05rem;">KALIBRASI...</div>
-                <div id="stat-ai-sub" style="font-size: 0.72rem; color: #8b949e; margin-top: 4px;">Iterasi #0 | Stabilitas: 85%</div>
+                <div id="stat-ai" class="value val-cyan">TRAINING...</div>
             </div>
         </div>
 
@@ -583,8 +542,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     } else {
                         serEl.className = 'value val-amber';
                     }
-                    document.getElementById('stat-ai').innerText = d.ai_status;
-                    document.getElementById('stat-ai-sub').innerText = '#' + d.ai_iteration + ' | Stabilitas: ' + d.ai_reward + '% | Speed: ' + d.ai_smooth + '%';
+                    document.getElementById('stat-ai').innerText = '#' + d.ai_iteration + ' (' + d.ai_reward + '%)';
                 })
                 .catch(e => console.error(e));
         }
@@ -711,7 +669,7 @@ def draw_hud(frame, target_box, conf, track_id, distance_m, fps, serial_status, 
     # 6. Footer Banner
     cv2.rectangle(frame, (0, h - 30), (w, h), (15, 15, 15), -1)
     if learner is not None:
-        footer_text = f"Serial: {serial_status} | AI: {learner.status} ({learner.reward_pct}%) | Pan:{learner.learned_speed_pan}% | DZ:{learner.learned_deadzone_x}px"
+        footer_text = f"Serial: {serial_status} | AI Train #{learner.iteration} ({learner.reward_pct}%) | Loss: {learner.best_loss:.1f} | Smooth: {learner.learned_smooth}%"
     else:
         footer_text = f"Serial: {serial_status} | Web HUD: http://localhost:8080"
     cv2.putText(frame, footer_text, (15, h - 10),
@@ -723,17 +681,17 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="Indeks kamera USB (default: 0)")
     parser.add_argument("--port", type=str, default=None, help="Port serial ESP32 (contoh: /dev/ttyUSB0)")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="Bobot model YOLO (default: yolov8n.pt)")
-    parser.add_argument("--conf", type=float, default=0.30, help="Ambang batas kepercayaan YOLO (default: 0.30)")
+    parser.add_argument("--conf", type=float, default=0.40, help="Ambang batas kepercayaan (default: 0.40)")
     parser.add_argument("--web-port", type=int, default=8080, help="Port Web HUD (default: 8080)")
     parser.add_argument("--gui", action="store_true", help="Buka jendela pop-up GUI desktop (jika display X11 aktif)")
     parser.add_argument("--dry-run", action="store_true", help="Jalankan simulasi tanpa kirim serial")
-    parser.add_argument("--reset-ai", action="store_true", help="Reset parameter pembelajaran AI ke nilai optimal default")
+    parser.add_argument("--reset-ai", action="store_true", help="Reset parameter pembelajaran AI ke nilai awal")
     args = parser.parse_args()
 
     if args.reset_ai and os.path.exists("servo_learned_ai.json"):
         try:
             os.remove("servo_learned_ai.json")
-            print("[AI LEARNER] File parameter lama 'servo_learned_ai.json' berhasil di-reset ke default!")
+            print("[AI LEARNER] File parameter lama 'servo_learned_ai.json' berhasil di-reset!")
         except Exception:
             pass
 
@@ -792,8 +750,6 @@ def main():
     smooth_err_x = 0.0
     smooth_err_y = 0.0
     locked_track_id = None
-    last_valid_human = None
-    coasting_counter = 0
     last_fps_time = time.time()
     last_terminal_print = 0.0
     frame_count = 0
@@ -861,13 +817,9 @@ def main():
                         "cy": y1 + bh // 2
                     })
 
-            # 6. Logika Penguncian Target Cerdas (Single-Person Priority & ID Persistence)
+            # 6. Logika Penguncian Target Cerdas (ID Persistence)
             target_human = None
-            if len(detected_humans) == 1:
-                # Hanya ada 1 orang di depan kamera -> Prioritas langsung kunci tanpa ragu!
-                target_human = detected_humans[0]
-                locked_track_id = target_human["id"]
-            elif len(detected_humans) > 1:
+            if len(detected_humans) > 0:
                 if locked_track_id is not None:
                     for h_obj in detected_humans:
                         if h_obj["id"] == locked_track_id:
@@ -881,18 +833,6 @@ def main():
                     target_human = detected_humans[0]
                     locked_track_id = target_human["id"]
 
-            # 6b. Target Coasting Memory (Mencegah dropout jika deteksi drop 1-12 frame)
-            if target_human is not None:
-                coasting_counter = 0
-                last_valid_human = target_human
-            elif last_valid_human is not None and coasting_counter < 12:
-                # Coasting: gunakan posisi terakhir agar tracking tidak putus-putus
-                coasting_counter += 1
-                target_human = last_valid_human
-            else:
-                last_valid_human = None
-                coasting_counter = 0
-
             # 7. Hitung Deviasi & Kirim ke ESP32
             if target_human is not None:
                 bx, by, bw, bh = target_human["box"]
@@ -903,17 +843,16 @@ def main():
                 raw_err_y = aim_cy - CENTER_Y
 
                 # Step pembelajaran mandiri (Continuous Online Auto-Trainer)
-                learner.step(raw_err_x, raw_err_y, bw, bh)
+                learner.step(raw_err_x, raw_err_y)
 
-                # Filter Anti-Jitter Ringan Tanpa Phase Lag (alpha = 0.80)
-                # Mencegah jitter kamera 1-2px tanpa menyebabkan keterlambatan pengereman servo
-                smooth_err_x = 0.80 * raw_err_x + 0.20 * smooth_err_x
-                smooth_err_y = 0.80 * raw_err_y + 0.20 * smooth_err_y
+                # Filter Trajektori EMA Super Halus (Anti-Sentak & Menjaga di Tengah)
+                alpha = max(0.12, min(0.38, 1.0 - (learner.learned_smooth / 100.0)))
+                smooth_err_x += alpha * (raw_err_x - smooth_err_x)
+                smooth_err_y += alpha * (raw_err_y - smooth_err_y)
 
-                # Kirim error piksel murni ke ESP32 agar PD controller di ESP32 bekerja presisi
-                # (Deadzone +/- 8px dan rem elektronik KD ditangani secara hardware-level oleh ESP32)
-                send_err_x = int(smooth_err_x)
-                send_err_y = int(smooth_err_y)
+                # Deadzone dinamis adaptif hasil training AI
+                send_err_x = int(smooth_err_x) if abs(smooth_err_x) > learner.learned_deadzone_x else 0
+                send_err_y = int(smooth_err_y) if abs(smooth_err_y) > learner.learned_deadzone_y else 0
 
                 dist_m = (HUMAN_REAL_HEIGHT_M * FOCAL_LENGTH_PX) / max(20, bh)
                 dist_m = max(0.5, min(8.0, dist_m))
@@ -926,8 +865,7 @@ def main():
 
                 with vision_state.lock:
                     vision_state.has_target = True
-                    target_label = f"ID #{target_human['id']}" if target_human['id'] is not None else "TARGET"
-                    vision_state.status = f"LOCKED: {target_label} ({int(target_human['conf']*100)}%)"
+                    vision_state.status = f"LOCKED: ID #{target_human['id']} ({int(target_human['conf']*100)}%)"
                     vision_state.target_id = target_human['id']
                     vision_state.conf = target_human['conf']
                     vision_state.distance_m = dist_m
@@ -954,7 +892,7 @@ def main():
                 last_terminal_print = now
                 ser_st = serial_sender.status
                 if target_human is not None:
-                    print(f"[LOCKED: ID #{target_human['id']} ({int(target_human['conf']*100)}%)] FPS: {fps:4.1f} | ErrX: {send_err_x:+4d} px | Jarak: {dist_m:4.2f} m | AI: {learner.status} ({learner.reward_pct}%) | Serial: {ser_st}")
+                    print(f"[LOCKED: ID #{target_human['id']} ({int(target_human['conf']*100)}%)] FPS: {fps:4.1f} | ErrX: {send_err_x:+4d} px | Jarak: {dist_m:4.2f} m | AI Train #{learner.iteration} ({learner.reward_pct}%) | Serial: {ser_st}")
                 else:
                     print(f"[      SCANNING 360      ] FPS: {fps:4.1f} | Mencari Target Manusia...     | AI Train #{learner.iteration} | Serial: {ser_st}")
 
