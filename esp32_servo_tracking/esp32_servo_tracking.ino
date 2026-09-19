@@ -63,8 +63,19 @@ Servo servoTilt;
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 
 // ================= VARIABEL GLOBAL =================
+float targetPanAngle  = PAN_MID;
+float targetTiltAngle = TILT_MID;
+
 float currentPan  = PAN_MID;
 float currentTilt = TILT_MID;
+
+// Kecepatan peluncuran trajektori (EMA Smooth Factor)
+// Nilai 0.22 memberikan sensasi "glide" halus seperti gimbal sinematik
+const float TRAJECTORY_SMOOTH_FACTOR = 0.22;
+
+inline int angleToMicros(float deg) {
+  return (int)(500.0 + (deg / 180.0) * 1900.0);
+}
 
 int targetErrX = 0;
 int targetErrY = 0;
@@ -153,33 +164,49 @@ void processPacket(char* pkt) {
       targetLocked = true;
       lastPacketTime = millis();
 
-      // 2. KENDALI PROPORSIONAL SERVO PAN-TILT DENGAN SLEW-RATE LIMITER (ANTI-SENTAK)
-      // Pan: Belokkan servo menuju posisi target horizontal
+      // 2. KENDALI PROPORSIONAL TARGET SUDUT SERVO (BEBAS SENTAK)
+      // Pan: Perbarui target sudut horizontal
       if (abs(targetErrX) > DEADZONE_PAN_PX) {
         float dirPan = INVERT_PAN ? 1.0 : -1.0;
         float deltaPan = dirPan * (targetErrX * KP_PAN);
-        // Batasi percepatan putar servo per frame agar gerakan halus dan tidak bergetar (anti-reog)
         deltaPan = constrain(deltaPan, -MAX_STEP_PAN, MAX_STEP_PAN);
-        currentPan += deltaPan;
-        currentPan = constrain(currentPan, PAN_MIN, PAN_MAX);
-        servoPan.write((int)currentPan);
+        targetPanAngle += deltaPan;
+        targetPanAngle = constrain(targetPanAngle, PAN_MIN, PAN_MAX);
       }
 
-      // Tilt: Arahkan kamera vertikal (nunduk/mendongak) - Sangat Tenang & Lembut
+      // Tilt: Perbarui target sudut vertikal
       if (abs(targetErrY) > DEADZONE_TILT_PX) {
         float dirTilt = INVERT_TILT ? -1.0 : 1.0;
         float deltaTilt = dirTilt * (targetErrY * KP_TILT);
         deltaTilt = constrain(deltaTilt, -MAX_STEP_TILT, MAX_STEP_TILT);
-        currentTilt += deltaTilt;
-        currentTilt = constrain(currentTilt, TILT_MIN, TILT_MAX);
-        servoTilt.write((int)currentTilt);
+        targetTiltAngle += deltaTilt;
+        targetTiltAngle = constrain(targetTiltAngle, TILT_MIN, TILT_MAX);
       }
     }
   }
 }
 
 void loop() {
-  // 1. BACA PAKET SERIAL 100% NON-BLOCKING (Zero-Timeout)
+  // 1. INTERPOLASI GERAKAN SERVO 100 Hz (SUPER BUTTER-SMOOTH, KELAS GIMBAL DJI)
+  static unsigned long lastSmoothTick = 0;
+  unsigned long nowMs = millis();
+  if (nowMs - lastSmoothTick >= 10) {
+    lastSmoothTick = nowMs;
+
+    float diffPan = targetPanAngle - currentPan;
+    if (abs(diffPan) > 0.02) {
+      currentPan += diffPan * TRAJECTORY_SMOOTH_FACTOR;
+      servoPan.writeMicroseconds(angleToMicros(currentPan));
+    }
+
+    float diffTilt = targetTiltAngle - currentTilt;
+    if (abs(diffTilt) > 0.02) {
+      currentTilt += diffTilt * TRAJECTORY_SMOOTH_FACTOR;
+      servoTilt.writeMicroseconds(angleToMicros(currentTilt));
+    }
+  }
+
+  // 2. BACA PAKET SERIAL 100% NON-BLOCKING (Zero-Timeout)
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
