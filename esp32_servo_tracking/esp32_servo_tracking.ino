@@ -44,13 +44,13 @@ const float TILT_MIN = 60.0;  // Batasi agar tidak mendongak/menunduk terlalu ek
 const float TILT_MAX = 120.0;
 const float TILT_MID = 90.0;
 
-// Parameter Kendali Servo Proporsional & Anti-Sentak (Smooth Slew-Rate Limiter)
-const int DEADZONE_PAN_PX   = 14;    // Zona toleransi anti-jitter horizontal (piksel)
-const int DEADZONE_TILT_PX  = 22;    // Zona toleransi vertikal lebih lebar (kamera tenang di horizon)
-const float KP_PAN          = 0.016; // Kecepatan belok Pan halus
-const float KP_TILT         = 0.007; // Kecepatan Tilt sangat lembut & tenang (anti-reog vertikal!)
-const float MAX_STEP_PAN    = 1.0;   // Maksimal 1.0 derajat per packet
-const float MAX_STEP_TILT   = 0.35;  // Maksimal 0.35 derajat per packet untuk vertikal (super tenang)
+// Parameter Kendali Servo Proporsional Cepat & Responsif (Xiaomi / DJI Gimbal Speed)
+const int DEADZONE_PAN_PX   = 8;     // Deadzone sempit, langsung bereaksi saat Anda bergerak
+const int DEADZONE_TILT_PX  = 10;    // Deadzone vertikal responsif
+const float KP_PAN          = 0.040; // 2.5x lebih lincah dan cepat merespons gerakan tubuh
+const float KP_TILT         = 0.022; // 3x lebih cepat & responsif mengikuti tinggi badan
+const float MAX_STEP_PAN    = 3.5;   // Maksimal 3.5 derajat per packet (sangat gesit & anti-lelet)
+const float MAX_STEP_TILT   = 2.0;   // Maksimal 2.0 derajat per packet
 const unsigned long SERIAL_TIMEOUT_MS = 600; // Timeout jika komunikasi terputus
 
 // Konfigurasi Arah Putaran Servo (Invert jika mekanik servo terpasang terbalik)
