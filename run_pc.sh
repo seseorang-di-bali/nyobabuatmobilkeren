@@ -10,4 +10,4 @@ echo " Memulai Vision Tracker di PC (Linux Test Drive)"
 echo " Web HUD: http://localhost:8080"
 echo "=========================================================="
 
-python3 vision_tracker.py --dry-run "$@"
+python3 vision_tracker.py "$@"

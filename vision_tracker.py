@@ -116,15 +116,28 @@ def find_camera_index(requested_index=None):
     return 0, default_name
 
 def find_serial_port():
-    """Mencari port serial ESP32 yang tersedia di Linux Armbian."""
+    """Mencari port serial ESP32 yang tersedia di Windows, Linux, atau Mac."""
+    try:
+        import serial.tools.list_ports
+        available = list(serial.tools.list_ports.comports())
+        for port_info in available:
+            desc = (port_info.description or "").lower()
+            hwid = (port_info.hwid or "").lower()
+            if any(k in desc or k in hwid for k in ["ch340", "cp210", "ftdi", "usb", "serial", "uart"]):
+                return port_info.device
+        if len(available) > 0:
+            return available[0].device
+    except Exception:
+        pass
+
     ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*") + \
             glob.glob("/dev/cu.usbserial*") + glob.glob("/dev/tty.usbserial*")
     if sys.platform.startswith('win'):
-        ports += [f"COM{i+1}" for i in range(256)]
+        ports += [f"COM{i+1}" for i in range(32)]
         
     for p in ports:
         try:
-            s = serial.Serial(p, 115200, timeout=0.1)
+            s = serial.Serial(p, 115200, timeout=0.05)
             s.close()
             return p
         except (OSError, serial.SerialException):
